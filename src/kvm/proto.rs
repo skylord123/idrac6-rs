@@ -73,6 +73,9 @@ pub mod ty {
 
     // server -> client, video channel (8 bit type)
     pub const VIDEO_DVC: u8 = 0x80;
+    /// Avocent DVC "Video Packet" types used by iDRAC6.
+    pub const VIDEO_DVC_FIRST: u8 = 0x81;
+    pub const VIDEO_DVC_LAST: u8 = 0x83;
     pub const VIDEO_CONNECT_STATUS: u8 = 0x84;
     pub const VIDEO_STOPPED: u8 = 0x85;
     pub const VIDEO_ASPEED: u8 = 0x86;

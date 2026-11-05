@@ -668,7 +668,7 @@ impl WindowUi for ConsoleWindow {
                 }
                 if self.can_input() && self.capture_keys {
                     ui.separator();
-                    ui.weak(if self.hovering_video { "Keyboard → server" } else { "Point at the screen to type" });
+                    ui.weak(if self.hovering_video { "Keyboard goes to the server" } else { "Point at the screen to type" });
                 }
             });
         });

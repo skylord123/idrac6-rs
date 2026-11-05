@@ -1,3 +1,5 @@
 .testcreds
+.testcreds*
+*.swp
 /target
 /re

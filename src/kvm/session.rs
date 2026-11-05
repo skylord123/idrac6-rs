@@ -308,7 +308,10 @@ fn command_thread(ctx: &Ctx, outgoing: Receiver<Vec<u8>>) -> Result<()> {
         // Flush queued input.
         loop {
             match outgoing.try_recv() {
-                Ok(m) => write_all(&mut conn, &m)?,
+                Ok(m) => {
+                    log::debug!("cmd >> {:02x?}", &m[..m.len().min(16)]);
+                    write_all(&mut conn, &m)?
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -441,6 +444,18 @@ fn video_thread(ctx: &Ctx, client_random: u32, session_id: u32) -> Result<()> {
     write_all(&mut conn, &proto::video_auth(client_random, session_id))?;
     let mut reader = FrameReader::new(false);
     let mut asm = VideoAssembler::new();
+    // Debug aid: IDRAC6_CAPTURE=<file> records every video message (8 byte
+    // header + payload) so decoding problems can be reproduced offline.
+    let mut capture = std::env::var_os("IDRAC6_CAPTURE").and_then(|p| match std::fs::File::create(&p) {
+        Ok(f) => {
+            log::info!("recording video messages to {}", std::path::Path::new(&p).display());
+            Some(std::io::BufWriter::new(f))
+        }
+        Err(e) => {
+            log::warn!("cannot create capture file: {e}");
+            None
+        }
+    });
     loop {
         if ctx.stopped() {
             return Ok(());
@@ -450,6 +465,13 @@ fn video_thread(ctx: &Ctx, client_random: u32, session_id: u32) -> Result<()> {
         }
         while let Some(m) = reader.next()? {
             ctx.shared.bytes_in.fetch_add(m.payload.len() as u64 + 8, Ordering::Relaxed);
+            if let Some(f) = capture.as_mut() {
+                let len = (m.payload.len() + proto::HEADER_LEN) as u16;
+                let mut hdr = *b"BEEF\0\0\0\0";
+                hdr[5] = m.ty as u8;
+                hdr[6..8].copy_from_slice(&len.to_be_bytes());
+                let _ = f.write_all(&hdr).and_then(|_| f.write_all(&m.payload)).and_then(|_| f.flush());
+            }
             if m.ty == ty::VIDEO_CONNECT_STATUS as u16 {
                 log::info!("video channel connected");
                 for msg in [proto::video_enable(true), proto::set_display_area(1024, 768), proto::scale_1to1()] {
@@ -467,13 +489,15 @@ fn video_thread(ctx: &Ctx, client_random: u32, session_id: u32) -> Result<()> {
 /// Collects ASPEED video packets into frames, decodes them and acks them.
 struct VideoAssembler {
     decoder: AspeedDecoder,
+    /// Avocent DVC codec: what iDRAC6 actually sends.
+    dvc: crate::video::dvc::DvcDecoder,
     pending: Option<(aspeed::AspeedFrameHeader, Vec<u8>)>,
     last_state: Option<VideoState>,
 }
 
 impl VideoAssembler {
     fn new() -> Self {
-        Self { decoder: AspeedDecoder::new(), pending: None, last_state: None }
+        Self { decoder: AspeedDecoder::new(), dvc: crate::video::dvc::DvcDecoder::new(), pending: None, last_state: None }
     }
 
     fn set_state(&mut self, ctx: &Ctx, s: VideoState) {
@@ -486,6 +510,26 @@ impl VideoAssembler {
     /// Handle one video message. Returns an ack to send back, if any.
     fn handle(&mut self, ctx: &Ctx, m: Message) -> Result<Option<Vec<u8>>> {
         match m.ty as u8 {
+            t @ (ty::VIDEO_DVC_FIRST..=ty::VIDEO_DVC_LAST) => {
+                self.set_state(ctx, VideoState::Active);
+                let mut fb = ctx.shared.fb.lock().unwrap();
+                let r = self.dvc.push_packet(t, &m.payload, &mut fb);
+                drop(fb);
+                match r {
+                    Ok(true) => {
+                        ctx.shared.frames.fetch_add(1, Ordering::Relaxed);
+                        ctx.shared.frame_seq.fetch_add(1, Ordering::Release);
+                        (ctx.notify)();
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::warn!("video decode failed: {e:#}");
+                        let _ = ctx.cmd_tx.send(proto::screen_refresh());
+                    }
+                }
+                // The Java viewer acknowledges every video packet.
+                Ok(Some(proto::video_ack(1)))
+            }
             ty::VIDEO_ASPEED => {
                 let hdr = aspeed::parse_header(&m.payload);
                 let data = m.payload.get(aspeed::HEADER_LEN..).unwrap_or(&[]);
