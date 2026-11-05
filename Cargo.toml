@@ -1,0 +1,73 @@
+[package]
+name = "idrac6"
+version = "0.1.0"
+edition = "2024"
+description = "Native virtual console (KVM), virtual media and web UI proxy for Dell iDRAC6"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/skylord123/idrac6-rs"
+authors = ["Skylar Sadlier <skylord123@gmail.com>"]
+keywords = ["idrac", "kvm", "dell", "ipmi", "remote-console"]
+categories = ["network-programming", "gui"]
+
+[features]
+default = []
+# Build OpenSSL from source and link it statically. Used for Windows and
+# portable release builds; Linux distro builds can use the system OpenSSL.
+vendored-openssl = ["openssl/vendored"]
+
+[dependencies]
+anyhow = "1"
+directories = "6"
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+egui_glow = { version = "0.37", features = ["winit"] }
+glow = "0.17"
+glutin = "0.32"
+glutin-winit = "0.5"
+winit = "0.30"
+env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+open = "5"
+openssl = "0.10"
+rand = "0.9"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# `cargo deb --features vendored-openssl` builds an Ubuntu/Debian package.
+[package.metadata.deb]
+name = "idrac6"
+section = "net"
+priority = "optional"
+depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libegl1 | libgl1"
+recommends = "xdg-desktop-portal"
+extended-description = """\
+Native replacement for the Dell iDRAC6 Java virtual console. Shows the \
+server screen with keyboard and mouse control, power control and \
+screenshots, maps ISO/IMG files as virtual media, and proxies the iDRAC6 \
+TLS 1.0 web interface so modern browsers can open it."""
+assets = [
+    ["target/release/idrac6", "usr/bin/", "755"],
+    ["assets/idrac6.desktop", "usr/share/applications/", "644"],
+    ["assets/icon-16.png", "usr/share/icons/hicolor/16x16/apps/idrac6.png", "644"],
+    ["assets/icon-24.png", "usr/share/icons/hicolor/24x24/apps/idrac6.png", "644"],
+    ["assets/icon-32.png", "usr/share/icons/hicolor/32x32/apps/idrac6.png", "644"],
+    ["assets/icon-48.png", "usr/share/icons/hicolor/48x48/apps/idrac6.png", "644"],
+    ["assets/icon-64.png", "usr/share/icons/hicolor/64x64/apps/idrac6.png", "644"],
+    ["assets/icon-128.png", "usr/share/icons/hicolor/128x128/apps/idrac6.png", "644"],
+    ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/idrac6.png", "644"],
+    ["assets/icon-512.png", "usr/share/icons/hicolor/512x512/apps/idrac6.png", "644"],
+    ["README.md", "usr/share/doc/idrac6/README.md", "644"],
+    ["docs/*.md", "usr/share/doc/idrac6/", "644"],
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

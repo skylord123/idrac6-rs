@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=iDRAC6 Console
+GenericName=Remote Server Console
+Comment=Virtual console, virtual media and web UI proxy for Dell iDRAC6
+Exec=idrac6
+Icon=idrac6
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=idrac;dell;kvm;ipmi;bmc;poweredge;server;
+StartupWMClass=idrac6
