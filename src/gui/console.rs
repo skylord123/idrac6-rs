@@ -45,6 +45,7 @@ pub struct ConsoleWindow {
     in_use_retry: bool,
     /// Connect with the "share" flag once the login finishes.
     pending_shared: bool,
+    focused: bool,
 
     texture: Option<egui::TextureHandle>,
     shown_seq: u64,
@@ -99,6 +100,7 @@ impl ConsoleWindow {
             sharing: None,
             in_use_retry: false,
             pending_shared: false,
+            focused: true,
             texture: None,
             shown_seq: 0,
             fit: true,
@@ -212,7 +214,12 @@ impl ConsoleWindow {
         for e in events {
             match e {
                 KvmEvent::Status(s) => self.status = s,
-                KvmEvent::Running => self.status = "Connected".into(),
+                KvmEvent::Running => {
+                    self.status = "Connected".into();
+                    if let Phase::Connected(s) = &self.phase {
+                        s.set_focus(self.focused);
+                    }
+                }
                 KvmEvent::LoginFailed(r) => {
                     self.in_use_retry = r.contains("already in use");
                     self.phase = Phase::Failed(r);
@@ -710,6 +717,10 @@ impl WindowUi for ConsoleWindow {
     }
 
     fn focus_changed(&mut self, focused: bool) {
+        self.focused = focused;
+        if let Some(s) = self.session() {
+            s.set_focus(focused);
+        }
         if !focused {
             // Otherwise e.g. Alt stays pressed on the server after Alt-Tab.
             self.release_all_keys();

@@ -126,6 +126,13 @@ impl KvmSession {
         let _ = self.cmd_tx.send(msg);
     }
 
+    /// Tell the iDRAC whether our window has the input focus, like the Java
+    /// viewer does. Keyboard input may be ignored until focus is set.
+    pub fn set_focus(&self, focused: bool) {
+        self.send(proto::focus(focused));
+        self.send(proto::keyboard_led_request());
+    }
+
     pub fn key(&self, usage: u16, pressed: bool) {
         self.send(proto::key(usage, pressed));
     }
