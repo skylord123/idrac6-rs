@@ -85,12 +85,14 @@ pub trait WindowUi {
     }
 }
 
+// Fields drop in declaration order: the GL surface and context must go
+// before the native window, or X11 reports GLXBadWindow on close.
 struct GlWin {
-    window: Arc<Window>,
+    ui: Box<dyn WindowUi>,
+    egui: egui_glow::EguiGlow,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
-    egui: egui_glow::EguiGlow,
-    ui: Box<dyn WindowUi>,
+    window: Arc<Window>,
     next_repaint: Option<Instant>,
 }
 
