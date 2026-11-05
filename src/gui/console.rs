@@ -724,9 +724,18 @@ impl WindowUi for ConsoleWindow {
         if let Phase::Connected(s) = &self.phase {
             s.close();
         }
-        if let Some(w) = self.web.take() {
-            thread::spawn(move || w.logout());
-        }
+        // The web session is logged out in Drop.
         true
+    }
+}
+
+impl Drop for ConsoleWindow {
+    fn drop(&mut self) {
+        // Log out synchronously: a background thread would be killed when
+        // the app exits, leaving the session open on the iDRAC, which only
+        // allows a few at a time.
+        if let Some(w) = self.web.take() {
+            w.logout();
+        }
     }
 }
