@@ -57,6 +57,7 @@ pub enum KvmEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoState {
     Active,
+    Calibrating,
     NoSignal,
     OutOfRange,
     Stopped(u8),
@@ -515,7 +516,8 @@ impl VideoAssembler {
             ty::VIDEO_STOPPED => {
                 let code = m.payload.first().copied().unwrap_or(0);
                 let s = match code {
-                    0 | 1 => VideoState::NoSignal,
+                    0 => VideoState::Calibrating,
+                    1 => VideoState::NoSignal,
                     2 => VideoState::OutOfRange,
                     c => VideoState::Stopped(c),
                 };

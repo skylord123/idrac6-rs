@@ -442,7 +442,9 @@ impl ConsoleWindow {
                     None => {
                         let text = match self.video_state {
                             Some(VideoState::NoSignal) => "No video signal from the server".to_string(),
-                            Some(VideoState::OutOfRange) => "Video mode out of range".to_string(),
+                            Some(VideoState::OutOfRange) => "The iDRAC reports the server's video mode is out of range.\nLower the resolution or refresh rate on the server (iDRAC6 supports up to 1280×1024 at 60 Hz).".to_string(),
+                            Some(VideoState::Calibrating) => "The iDRAC is calibrating the video signal…".to_string(),
+                            Some(VideoState::Stopped(c)) => format!("Video is blocked or stopped by the iDRAC (code {c})."),
                             _ => self.status.clone(),
                         };
                         ui.vertical_centered(|ui| {
