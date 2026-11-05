@@ -431,36 +431,51 @@ impl ConsoleWindow {
                 Phase::Failed(m) if !m.is_empty() => Some(m.clone()),
                 _ => None,
             };
-            ui.centered_and_justified(|ui| {
-                match failed {
-                    Some(m) => {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(avail.y / 3.0);
-                            ui.colored_label(ui.visuals().error_fg_color, m);
-                            ui.add_space(8.0);
-                            if ui.button("Try again").clicked() {
-                                self.reconnect(false);
-                            }
-                            if self.in_use_retry && ui.button("Ask the current user to share").clicked() {
-                                self.reconnect(true);
-                            }
-                        });
+            if let Some(m) = failed {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(avail.y / 3.0);
+                        ui.colored_label(ui.visuals().error_fg_color, m);
+                        ui.add_space(8.0);
+                        if ui.button("Try again").clicked() {
+                            self.reconnect(false);
+                        }
+                        if self.in_use_retry && ui.button("Ask the current user to share").clicked() {
+                            self.reconnect(true);
+                        }
+                    });
+                });
+                return;
+            }
+            // No picture yet (connecting, no signal, out of range, screen
+            // asleep). The area still takes keyboard and mouse input, so a
+            // key press or click can wake the server's screen.
+            let resp = ui.allocate_rect(ui.max_rect(), egui::Sense::click_and_drag());
+            self.hovering_video = resp.hovered() || resp.dragged();
+            if self.can_input() {
+                let (w, h) = self.resolution.map(|(w, h)| (w as f32, h as f32)).unwrap_or((1024.0, 768.0));
+                self.mouse_input(ui, &resp, w, h);
+            }
+            let wake = "Press a key or click here to wake the server's screen.";
+            let (text, spinner) = match self.video_state {
+                Some(VideoState::NoSignal) => (format!("No video signal from the server.\n{wake}"), false),
+                Some(VideoState::OutOfRange) => (
+                    format!("The iDRAC reports the video mode is out of range.\n{wake}\nIf it stays like this, lower the server's resolution (iDRAC6 supports up to 1280×1024 at 60 Hz)."),
+                    false,
+                ),
+                Some(VideoState::Calibrating) => ("The iDRAC is calibrating the video signal…".to_string(), true),
+                Some(VideoState::Stopped(c)) => (format!("Video is blocked or stopped by the iDRAC (code {c})."), false),
+                _ => (self.status.clone(), true),
+            };
+            let rect = resp.rect;
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(rect.height() / 3.0);
+                    if spinner {
+                        ui.spinner();
                     }
-                    None => {
-                        let text = match self.video_state {
-                            Some(VideoState::NoSignal) => "No video signal from the server".to_string(),
-                            Some(VideoState::OutOfRange) => "The iDRAC reports the server's video mode is out of range.\nLower the resolution or refresh rate on the server (iDRAC6 supports up to 1280×1024 at 60 Hz).".to_string(),
-                            Some(VideoState::Calibrating) => "The iDRAC is calibrating the video signal…".to_string(),
-                            Some(VideoState::Stopped(c)) => format!("Video is blocked or stopped by the iDRAC (code {c})."),
-                            _ => self.status.clone(),
-                        };
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(avail.y / 3.0);
-                            ui.spinner();
-                            ui.label(text);
-                        });
-                    }
-                }
+                    ui.label(egui::RichText::new(text).color(egui::Color32::from_gray(200)));
+                });
             });
             return;
         };
