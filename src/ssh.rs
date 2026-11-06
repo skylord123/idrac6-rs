@@ -79,7 +79,9 @@ fn ssh_args(inst: &Instance, mode: Mode) -> Vec<String> {
     a.extend([
         // The iDRAC's own host keys, kept apart from the user's.
         "-o".into(),
-        format!("UserKnownHostsFile={}", known_hosts.display()),
+        // Quoted: the option takes a list separated by spaces, and the
+        // settings directory can contain them.
+        format!("UserKnownHostsFile=\"{}\"", known_hosts.display()),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
         // Keys from the user's agent would only use up login attempts.
@@ -87,6 +89,10 @@ fn ssh_args(inst: &Instance, mode: Mode) -> Vec<String> {
         "PubkeyAuthentication=no".into(),
         "-o".into(),
         "PreferredAuthentications=password,keyboard-interactive".into(),
+        // A wrong saved password is tried once, not until the iDRAC
+        // blocks this address (5 failures a minute by default).
+        "-o".into(),
+        "NumberOfPasswordPrompts=1".into(),
         "-p".into(),
         inst.ssh_port.to_string(),
         "-l".into(),
@@ -95,6 +101,8 @@ fn ssh_args(inst: &Instance, mode: Mode) -> Vec<String> {
     if mode == Mode::Serial {
         a.push("-t".into());
     }
+    // A host starting with "-" is not an option.
+    a.push("--".into());
     a.push(inst.host.clone());
     if mode == Mode::Serial {
         a.extend(["console".into(), "com2".into()]);
@@ -102,8 +110,8 @@ fn ssh_args(inst: &Instance, mode: Mode) -> Vec<String> {
     a
 }
 
-/// The ssh process for `inst`, with the saved password (if any) given
-/// through idrac6 as `SSH_ASKPASS`.
+/// The ssh process for `inst`, with the saved password (if there is one)
+/// given through idrac6 as `SSH_ASKPASS`.
 fn command(inst: &Instance, mode: Mode) -> Result<Command> {
     let Some(ssh) = find_ssh() else {
         bail!("ssh was not found. {}", install_hint());
@@ -111,7 +119,7 @@ fn command(inst: &Instance, mode: Mode) -> Result<Command> {
     std::fs::create_dir_all(config::config_dir()).ok();
     let mut cmd = Command::new(ssh);
     cmd.args(ssh_args(inst, mode));
-    if !inst.password.is_empty() {
+    if saved_password(inst).is_some() {
         let exe = std::env::current_exe().context("finding idrac6's own path")?;
         cmd.env("SSH_ASKPASS", exe).env("SSH_ASKPASS_REQUIRE", "force").env(ASKPASS_ENV, lookup_key(inst));
     }
@@ -155,22 +163,37 @@ fn lookup_key(inst: &Instance) -> String {
     format!("{}@{}:{}", inst.username, inst.host, inst.https_port)
 }
 
+/// The password saved for the iDRAC with `key`.
+fn saved_by_key(key: &str) -> Option<Instance> {
+    config::Config::load().instances.into_iter().find(|i| lookup_key(i) == key && !i.password.is_empty())
+}
+
+/// The password saved for `inst` (not one only typed in this run, which
+/// the helper process could not get).
+fn saved_password(inst: &Instance) -> Option<String> {
+    saved_by_key(&lookup_key(inst)).map(|i| i.password)
+}
+
+/// Whether ssh's `prompt` asks for the password of `inst` itself, e.g.
+/// "root@192.168.1.120's password: ", and not of a jump host or for a
+/// host key confirmation.
+fn is_password_prompt_for(prompt: &str, inst: &Instance) -> bool {
+    let p = prompt.to_ascii_lowercase();
+    p.contains("password") && p.contains(&format!("{}@{}", inst.username, inst.host).to_ascii_lowercase())
+}
+
 /// Called first in `main`: when ssh runs idrac6 as its password helper,
 /// answer and exit.
 pub fn askpass_hook() {
     let Some(key) = std::env::var_os(ASKPASS_ENV) else { return };
     let prompt = std::env::args().nth(1).unwrap_or_default();
-    // Only answer password prompts, not host key questions.
-    if !prompt.to_ascii_lowercase().contains("password") {
-        std::process::exit(1);
+    match saved_by_key(&key.to_string_lossy()) {
+        Some(inst) if is_password_prompt_for(&prompt, &inst) => {
+            println!("{}", inst.password);
+            std::process::exit(0);
+        }
+        _ => std::process::exit(1),
     }
-    let key = key.to_string_lossy();
-    let pw = config::Config::load().instances.into_iter().find(|i| lookup_key(i) == key).map(|i| i.password).unwrap_or_default();
-    if pw.is_empty() {
-        std::process::exit(1);
-    }
-    println!("{pw}");
-    std::process::exit(0);
 }
 
 /// Open a terminal window running `idrac6 ssh` for `inst`.
@@ -194,6 +217,12 @@ pub fn open_terminal(inst: &Instance, mode: Mode, custom: &str) -> Result<()> {
 pub fn open_terminal(inst: &Instance, mode: Mode, _custom: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_CONSOLE: u32 = 0x10;
+    // cmd.exe would expand or end quoting at these.
+    for v in [&inst.host, &inst.username] {
+        if v.contains(['"', '%', '\r', '\n']) {
+            bail!("the address and user name can't contain \" or %");
+        }
+    }
     let ssh = command(inst, mode)?;
     let quote = |a: &std::ffi::OsStr| {
         let a = a.to_string_lossy();
@@ -357,10 +386,21 @@ mod tests {
         let a = ssh_args(&inst, Mode::Shell);
         assert!(a.windows(2).any(|w| w == ["-o", "HostKeyAlgorithms=+ssh-rsa"]));
         assert!(a.windows(2).any(|w| w == ["-p", "2222"]));
-        assert_eq!(a.last().unwrap(), "10.0.0.5");
+        assert_eq!(&a[a.len() - 2..], ["--", "10.0.0.5"]);
+        assert!(a.iter().any(|o| o == "NumberOfPasswordPrompts=1"));
+        assert!(a.iter().any(|o| o.starts_with("UserKnownHostsFile=\"") && o.ends_with('"')));
         assert!(!a.contains(&"-t".to_string()));
         let s = ssh_args(&inst, Mode::Serial);
-        assert_eq!(&s[s.len() - 4..], ["-t", "10.0.0.5", "console", "com2"]);
+        assert_eq!(&s[s.len() - 5..], ["-t", "--", "10.0.0.5", "console", "com2"]);
+    }
+
+    #[test]
+    fn answers_only_the_idracs_prompt() {
+        let inst = Instance { host: "10.0.0.5".into(), username: "root".into(), ..Default::default() };
+        assert!(is_password_prompt_for("root@10.0.0.5's password: ", &inst));
+        assert!(!is_password_prompt_for("me@bastion.example's password: ", &inst));
+        assert!(!is_password_prompt_for("Are you sure you want to continue connecting (yes/no)?", &inst));
+        assert!(!is_password_prompt_for("Enter passphrase for key: root@10.0.0.5", &inst));
     }
 
     #[test]
