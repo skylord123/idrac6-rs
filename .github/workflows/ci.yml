@@ -13,8 +13,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Inno Setup used for the Windows installer.
-  INNO_VERSION: 6.7.4
 
 jobs:
   linux:
@@ -87,14 +85,25 @@ jobs:
           $out = & target/release/idrac6-cli.exe --version
           if ($out -notmatch '^idrac6 \d') { throw "idrac6-cli --version printed '$out'" }
           $out
-      - name: Install Inno Setup
+      # Inno Setup builds the installer. Runner images usually have it;
+      # otherwise Chocolatey installs it.
+      - name: Find Inno Setup
         shell: pwsh
+        timeout-minutes: 10
         run: |
-          $tag = "is-" + $env:INNO_VERSION.Replace('.', '_')
-          $url = "https://github.com/jrsoftware/issrc/releases/download/$tag/innosetup-$env:INNO_VERSION.exe"
-          Invoke-WebRequest $url -OutFile innosetup.exe
-          Start-Process innosetup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/DIR=C:\InnoSetup' -Wait
-          if (-not (Test-Path C:\InnoSetup\ISCC.exe)) { throw "Inno Setup did not install" }
+          function Find-Iscc {
+            Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe", "$env:ProgramFiles\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "installing Inno Setup failed" }
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw "ISCC.exe not found" }
+          "Using $iscc"
+          "ISCC=$iscc" >> $env:GITHUB_ENV
       - name: Package
         shell: pwsh
         run: |
@@ -103,18 +112,24 @@ jobs:
           Copy-Item target/release/idrac6.exe, target/release/idrac6-cli.exe, README.md pkg/
           Copy-Item LICENSE pkg/LICENSE.txt
           Compress-Archive -Path pkg/* -DestinationPath dist/idrac6-windows-x86_64.zip
-          & C:\InnoSetup\ISCC.exe /Q "/DAppVersion=$version" packaging\windows\idrac6.iss
+          & $env:ISCC /Q "/DAppVersion=$version" packaging\windows\idrac6.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
           Copy-Item target/installer/idrac6-windows-x86_64-setup.exe dist/
       - name: Check the installer
         shell: pwsh
+        timeout-minutes: 5
         run: |
           $dir = "$env:RUNNER_TEMP\idrac6-install"
-          Start-Process dist/idrac6-windows-x86_64-setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', "/DIR=$dir" -Wait
+          # Wait for setup itself only (Start-Process -Wait also waits for
+          # anything it leaves running).
+          $p = Start-Process dist/idrac6-windows-x86_64-setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', "/DIR=$dir" -PassThru
+          if (-not $p.WaitForExit(180000)) { throw "the installer did not finish" }
+          if ($p.ExitCode -ne 0) { throw "the installer exited with $($p.ExitCode)" }
           foreach ($f in 'idrac6.exe', 'idrac6-cli.exe') {
             if (-not (Test-Path "$dir\$f")) { throw "the installer did not install $f" }
           }
-          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait
+          $u = Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -PassThru
+          $null = $u.WaitForExit(120000)
       - uses: actions/upload-artifact@v4
         with:
           name: idrac6-windows
