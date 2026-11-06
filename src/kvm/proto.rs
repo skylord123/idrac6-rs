@@ -596,7 +596,8 @@ pub fn parse_sharing_request(p: &[u8]) -> SharingRequest {
     }
 }
 
-/// Keyboard LED state.
+/// Keyboard LED state. The byte uses the PS/2 keyboard LED order:
+/// bit 0 Scroll Lock, bit 1 Num Lock, bit 2 Caps Lock.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Leds {
     pub num: bool,
@@ -606,7 +607,7 @@ pub struct Leds {
 
 pub fn parse_leds(p: &[u8]) -> Leds {
     let b = p.first().copied().unwrap_or(0);
-    Leds { num: b & 1 != 0, caps: b & 2 != 0, scroll: b & 4 != 0 }
+    Leds { scroll: b & 1 != 0, num: b & 2 != 0, caps: b & 4 != 0 }
 }
 
 pub fn parse_resolution(p: &[u8]) -> (u16, u16) {
@@ -616,6 +617,13 @@ pub fn parse_resolution(p: &[u8]) -> (u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn led_bits() {
+        assert_eq!(parse_leds(&[1]), Leds { scroll: true, ..Default::default() });
+        assert_eq!(parse_leds(&[2]), Leds { num: true, ..Default::default() });
+        assert_eq!(parse_leds(&[4]), Leds { caps: true, ..Default::default() });
+    }
 
     #[test]
     fn beef_header() {
