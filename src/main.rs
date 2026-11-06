@@ -20,6 +20,8 @@ USAGE:
     idrac6                      Open the console manager (GUI)
     idrac6 console <name|host> Open the console of a saved iDRAC directly
     idrac6 captures <name|host> Replay the boot recordings of a saved iDRAC
+    idrac6 play <file>          Replay a console recording (.dvcrec) or a
+                                boot capture file
     idrac6 mount <name|host> <image> [--read-write]
                                 Attach an .iso (CD/DVD) or .img (disk) as
                                 virtual media until Enter is pressed
@@ -57,6 +59,10 @@ fn main() {
                 }
             })
         }
+        Some("play") => match args.get(1) {
+            Some(f) => gui::run(Box::new(gui::PlaybackWindow::from_file(f.into()))),
+            None => Err(anyhow::anyhow!("usage: idrac6 play <file>")),
+        },
         Some("mount") => (|| {
             let (Some(want), Some(image)) = (args.get(1), args.get(2)) else {
                 anyhow::bail!("usage: idrac6 mount <name|host> <image> [--read-write]");

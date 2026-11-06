@@ -1,5 +1,7 @@
-//! Boot capture player: replays the boot recordings the iDRAC6 keeps.
+//! Player for the boot recordings the iDRAC6 keeps and for console
+//! recordings saved by idrac6-rs (same format).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -23,7 +25,10 @@ enum State {
 }
 
 pub struct PlaybackWindow {
-    inst: Instance,
+    /// Boot captures of this iDRAC, or
+    inst: Option<Instance>,
+    /// a recording file.
+    file: Option<PathBuf>,
     state: State,
     selected: usize,
     player: Option<Player>,
@@ -43,8 +48,19 @@ pub struct PlaybackWindow {
 
 impl PlaybackWindow {
     pub fn new(inst: Instance) -> Self {
+        Self::make(Some(inst), None)
+    }
+
+    /// Play a recording file (a console recording or a downloaded boot
+    /// capture).
+    pub fn from_file(path: PathBuf) -> Self {
+        Self::make(None, Some(path))
+    }
+
+    fn make(inst: Option<Instance>, file: Option<PathBuf>) -> Self {
         Self {
             inst,
+            file,
             state: State::Failed(String::new()),
             selected: 0,
             player: None,
@@ -72,7 +88,7 @@ impl PlaybackWindow {
     /// Log in, run `f` with the web session, log out.
     fn with_web<T: Send + 'static>(&self, f: impl FnOnce(&WebSession) -> anyhow::Result<T> + Send + 'static) -> Receiver<anyhow::Result<T>> {
         let (tx, rx) = mpsc::channel();
-        let inst = self.inst.clone();
+        let inst = self.inst.clone().expect("instance");
         let notify = self.notifier();
         thread::spawn(move || {
             let r = WebSession::login(&inst.host, inst.https_port, &inst.username, &inst.password).and_then(|w| {
@@ -84,6 +100,38 @@ impl PlaybackWindow {
             notify();
         });
         rx
+    }
+
+    fn load_file(&mut self, path: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        let notify = self.notifier();
+        let p = path.clone();
+        thread::spawn(move || {
+            let _ = tx.send(std::fs::read(&p).map_err(|e| anyhow::anyhow!("Could not read {}: {e}", p.display())));
+            notify();
+        });
+        self.file = Some(path);
+        self.player = None;
+        self.texture = None;
+        self.state = State::Loading(Vec::new(), rx);
+    }
+
+    fn open_dialog(&mut self) {
+        let mut d = rfd::FileDialog::new().add_filter("Recordings", &["dvcrec"]).add_filter("All files", &["*"]);
+        if let Some(dir) = self.file.as_ref().and_then(|f| f.parent()) {
+            d = d.set_directory(dir);
+        }
+        if let Some(p) = d.pick_file() {
+            self.load_file(p);
+        }
+    }
+
+    fn title(&self) -> String {
+        match (&self.inst, &self.file) {
+            (Some(i), _) => format!("{} - Boot Capture", i.title()),
+            (None, Some(f)) => format!("{} - Recording", f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            (None, None) => "Recording".into(),
+        }
     }
 
     fn list(&mut self) {
@@ -209,13 +257,19 @@ impl PlaybackWindow {
             ui.label(format!("Frame: {frame}"));
             ui.label(format!("{} / {}", mmss(self.pos.min(total)), mmss(total)));
             ui.separator();
-            egui::ComboBox::from_id_salt("rec").selected_text(rec_label(&list[self.selected], self.selected)).show_ui(ui, |ui| {
-                for (i, c) in list.iter().enumerate() {
-                    if ui.selectable_label(i == self.selected, rec_label(c, i)).clicked() && i != self.selected {
-                        self.pending_load = Some(i);
-                    }
+            if list.is_empty() {
+                if ui.button("Open…").on_hover_text("Open another recording file").clicked() {
+                    self.open_dialog();
                 }
-            });
+            } else {
+                egui::ComboBox::from_id_salt("rec").selected_text(rec_label(&list[self.selected], self.selected)).show_ui(ui, |ui| {
+                    for (i, c) in list.iter().enumerate() {
+                        if ui.selectable_label(i == self.selected, rec_label(c, i)).clicked() && i != self.selected {
+                            self.pending_load = Some(i);
+                        }
+                    }
+                });
+            }
             if ui.button("Save screenshot…").clicked() {
                 self.screenshot();
             }
@@ -238,7 +292,8 @@ impl PlaybackWindow {
             return;
         }
         let rgb: Vec<u8> = self.fb.pixels.iter().flat_map(|&p| [(p >> 16) as u8, (p >> 8) as u8, p as u8]).collect();
-        let Some(path) = rfd::FileDialog::new().set_file_name("boot-capture.png").add_filter("PNG image", &["png"]).save_file() else { return };
+        let name = if self.inst.is_some() { "boot-capture.png" } else { "recording.png" };
+        let Some(path) = rfd::FileDialog::new().set_file_name(name).add_filter("PNG image", &["png"]).save_file() else { return };
         self.message = Some(match image::RgbImage::from_raw(self.fb.width as u32, self.fb.height as u32, rgb).map(|i| i.save(&path)) {
             Some(Ok(())) => format!("Saved {}", path.display()),
             _ => "Could not save the screenshot.".into(),
@@ -262,14 +317,17 @@ fn mmss(d: Duration) -> String {
 impl WindowUi for PlaybackWindow {
     fn attributes(&self) -> WindowAttributes {
         super::base_attributes()
-            .with_title(format!("{} - Boot Capture", self.inst.title()))
+            .with_title(self.title())
             .with_inner_size(LogicalSize::new(900.0, 640.0))
     }
 
     fn created(&mut self, window: &Window, proxy: &EventLoopProxy<UserEvent>) {
         self.window_id = Some(window.id());
         self.proxy = Some(proxy.clone());
-        self.list();
+        match self.file.clone() {
+            Some(f) => self.load_file(f),
+            None => self.list(),
+        }
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _window: &Window, _shell: &mut Shell) {
@@ -291,12 +349,30 @@ impl WindowUi for PlaybackWindow {
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::BLACK)).show(root, |ui| {
             let status = match &self.state {
                 State::Listing(_) => Some("Looking for boot recordings…".to_string()),
+                State::Loading(..) if self.inst.is_none() => Some("Loading the recording…".to_string()),
                 State::Loading(..) => Some("Downloading the recording…".to_string()),
                 State::Failed(m) => Some(m.clone()),
                 _ => None,
             };
             if let Some(s) = status {
-                ui.centered_and_justified(|ui| ui.label(egui::RichText::new(s).color(egui::Color32::from_gray(200))));
+                let failed = matches!(self.state, State::Failed(_));
+                let file = self.inst.is_none();
+                let rect = ui.max_rect();
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(rect.height() / 2.0 - 30.0);
+                        if !failed {
+                            ui.spinner();
+                        }
+                        ui.label(egui::RichText::new(s).color(egui::Color32::from_gray(200)));
+                        if failed && file {
+                            ui.add_space(8.0);
+                            if ui.button("Open another file…").clicked() {
+                                self.open_dialog();
+                            }
+                        }
+                    });
+                });
                 return;
             }
             if let Some(t) = &self.texture {

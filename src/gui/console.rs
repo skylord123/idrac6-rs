@@ -18,7 +18,8 @@ use super::{Shell, UserEvent, WindowUi};
 use crate::config::Instance;
 use crate::kvm::keymap::{self, Macro};
 use crate::kvm::proto::{self, Bandwidth, PowerAction, SharingAnswer, buttons};
-use crate::kvm::session::{KvmEvent, KvmSession, VideoState};
+use crate::kvm::session::{KvmEvent, KvmSession, Recorder, VideoState};
+use crate::video::playback::Writer;
 use crate::kvm::typer::{self, Speed, TypeJob};
 use crate::web::{ConsoleInfo, WebSession};
 
@@ -96,6 +97,12 @@ pub struct ConsoleWindow {
     /// Web sessions of earlier connections that still need logging out
     /// (the logout failed while the iDRAC was unreachable).
     old_webs: Arc<Mutex<Vec<Arc<WebSession>>>>,
+    /// File → Start recording. Kept across reconnects.
+    recorder: Recorder,
+    /// A finished recording to tell the user about.
+    saved_recording: Option<(std::path::PathBuf, Duration, u64)>,
+    /// Open the player for this file on the next frame.
+    play_file: Option<std::path::PathBuf>,
 }
 
 struct Notice {
@@ -216,6 +223,9 @@ impl ConsoleWindow {
             end_reason: None,
             stale: false,
             old_webs: Arc::default(),
+            recorder: Recorder::default(),
+            saved_recording: None,
+            play_file: None,
         }
     }
 
@@ -259,7 +269,7 @@ impl ConsoleWindow {
     fn connect(&mut self, shared: bool) {
         let Some(info) = &self.info else { return };
         let params = info.kvm_params(&self.inst.host, shared);
-        let session = KvmSession::start(params, self.notifier());
+        let session = KvmSession::start_with_recorder(params, self.notifier(), self.recorder.clone());
         self.phase = Phase::Connected(session);
     }
 
@@ -546,6 +556,33 @@ impl ConsoleWindow {
         }
     }
 
+    fn recording(&self) -> Option<Duration> {
+        self.recorder.lock().unwrap().as_ref().map(Writer::elapsed)
+    }
+
+    fn start_recording(&mut self) {
+        let name = format!("{}-{}.dvcrec", file_safe(self.inst.title()), timestamp());
+        let Some(path) = rfd::FileDialog::new().set_file_name(&name).add_filter("Console recording", &["dvcrec"]).save_file() else { return };
+        match Writer::create(&path) {
+            Ok(w) => {
+                *self.recorder.lock().unwrap() = Some(w);
+                // Start with a complete picture.
+                if let Some(s) = self.session() {
+                    s.refresh();
+                }
+            }
+            Err(e) => self.message = Some(format!("Could not start recording: {e:#}")),
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let Some(w) = self.recorder.lock().unwrap().take() else { return };
+        match w.finish() {
+            Ok(r) => self.saved_recording = Some(r),
+            Err(e) => self.message = Some(format!("The recording could not be saved completely: {e:#}")),
+        }
+    }
+
     fn screenshot(&mut self) {
         let Some(s) = self.session() else { return };
         let (w, h, rgb) = {
@@ -557,7 +594,7 @@ impl ConsoleWindow {
             self.message = Some("There is no picture to save yet.".into());
             return;
         }
-        let name = format!("{}-{}.png", self.inst.title().replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"), timestamp());
+        let name = format!("{}-{}.png", file_safe(self.inst.title()), timestamp());
         let Some(path) = rfd::FileDialog::new().set_file_name(&name).add_filter("PNG image", &["png"]).save_file() else { return };
         let r = image::RgbImage::from_raw(w, h, rgb).map(|img| img.save(&path));
         self.message = Some(match r {
@@ -576,6 +613,18 @@ impl ConsoleWindow {
                 }
                 if ui.add_enabled(has_picture, egui::Button::new("Copy screenshot")).clicked() {
                     self.copy_screenshot();
+                }
+                ui.separator();
+                if self.recording().is_some() {
+                    if ui.button("Stop recording").clicked() {
+                        self.stop_recording();
+                    }
+                } else if ui
+                    .add_enabled(self.session().is_some(), egui::Button::new("Start recording…"))
+                    .on_hover_text("Record the screen to a file you can replay with Open recording")
+                    .clicked()
+                {
+                    self.start_recording();
                 }
                 ui.separator();
                 if ui.button("Reconnect").clicked() {
@@ -730,6 +779,20 @@ impl ConsoleWindow {
                     if r.clicked() {
                         self.set_user_view_only(false);
                     }
+                }
+                if let Some(t) = self.recording() {
+                    ui.separator();
+                    let s = t.as_secs();
+                    let red = egui::Color32::from_rgb(230, 70, 70);
+                    let r = ui
+                        .add(egui::Button::new(egui::RichText::new(format!("REC {}:{:02}", s / 60, s % 60)).color(red)).small())
+                        .on_hover_text("Recording the screen. Click to stop.");
+                    ui.painter().circle_filled(egui::pos2(r.rect.left() - 8.0, r.rect.center().y), 4.0, red);
+                    ui.add_space(14.0);
+                    if r.clicked() {
+                        self.stop_recording();
+                    }
+                    ui.ctx().request_repaint_after(Duration::from_millis(1000 - (t.as_millis() % 1000) as u64));
                 }
             });
         });
@@ -1153,6 +1216,40 @@ impl ConsoleWindow {
                 self.sharing = None;
             }
         }
+        if let Some((path, len, bytes)) = self.saved_recording.clone() {
+            let mut close = false;
+            egui::Modal::new(egui::Id::unique("rec-saved")).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.heading("Recording saved");
+                ui.add_space(4.0);
+                let s = len.as_secs();
+                ui.label(format!("{}:{:02} recorded, {:.1} MB.", s / 60, s % 60, bytes as f64 / 1_000_000.0));
+                ui.weak(path.display().to_string());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Play").clicked() {
+                        self.play_file = Some(path.clone());
+                        close = true;
+                    }
+                    if ui.button("Show folder").clicked() {
+                        if let Some(dir) = path.parent() {
+                            let _ = open::that(dir);
+                        }
+                    }
+                    if ui.button("OK").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if close {
+                self.saved_recording = None;
+            }
+        }
+        let write_error = self.recorder.lock().unwrap().as_ref().and_then(|w| w.error.clone());
+        if let Some(e) = write_error {
+            self.recorder.lock().unwrap().take();
+            self.message = Some(format!("Recording stopped: {e}"));
+        }
         if let Some(m) = self.message.clone() {
             let mut close = false;
             egui::Modal::new(egui::Id::unique("msg")).show(ctx, |ui| {
@@ -1185,9 +1282,25 @@ fn led(ui: &mut egui::Ui, name: &str, on: bool) {
     ui.colored_label(c, name);
 }
 
+/// "2026-11-06_071530" (UTC), for file names.
 fn timestamp() -> String {
-    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    s.to_string()
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}_{:02}{:02}{:02}", rem / 3600, rem / 60 % 60, rem % 60)
+}
+
+fn file_safe(name: &str) -> String {
+    name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '.', "_")
 }
 
 impl WindowUi for ConsoleWindow {
@@ -1267,6 +1380,9 @@ impl WindowUi for ConsoleWindow {
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::BLACK)).show(root, |ui| self.video(ui));
         self.dialogs(&ctx);
         self.type_dialog(&ctx);
+        if let Some(p) = self.play_file.take() {
+            shell.open.push(Box::new(super::PlaybackWindow::from_file(p)));
+        }
         if self.typing.as_ref().is_some_and(|j| j.finished()) {
             self.typing = None;
         }
@@ -1294,7 +1410,12 @@ impl WindowUi for ConsoleWindow {
     fn raw_key(&mut self, ev: &KeyEvent) -> bool {
         // Keys go to the server while the pointer is over the video and no
         // dialog is open, like a KVM switch.
-        let modal_open = self.confirm_power.is_some() || self.sharing.is_some() || self.message.is_some() || self.show_about || self.type_text.is_some();
+        let modal_open = self.confirm_power.is_some()
+            || self.sharing.is_some()
+            || self.message.is_some()
+            || self.show_about
+            || self.type_text.is_some()
+            || self.saved_recording.is_some();
         // Over the Virtual Media window the keyboard belongs to egui.
         if !self.capture_keys || !self.can_input() || modal_open {
             return false;
@@ -1350,6 +1471,11 @@ impl WindowUi for ConsoleWindow {
     }
 
     fn close_requested(&mut self) -> bool {
+        if let Some(w) = self.recorder.lock().unwrap().take() {
+            if let Err(e) = w.finish() {
+                log::error!("{e:#}");
+            }
+        }
         self.release_all_keys();
         self.vm.disconnect();
         if let Phase::Connected(s) = &self.phase {

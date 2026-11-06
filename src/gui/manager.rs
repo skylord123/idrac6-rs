@@ -648,6 +648,11 @@ impl WindowUi for ManagerWindow {
                         self.editing = Some((None, Instance::default()));
                     }
                     self.settings_menu(ui);
+                    if ui.button("Open recording…").on_hover_text("Replay a console recording or a saved boot capture").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().add_filter("Recordings", &["dvcrec"]).add_filter("All files", &["*"]).pick_file() {
+                            shell.open.push(Box::new(PlaybackWindow::from_file(p)));
+                        }
+                    }
                 });
             });
             ui.add_space(6.0);

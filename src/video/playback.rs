@@ -1,4 +1,5 @@
-//! iDRAC6 Boot Capture recordings.
+//! iDRAC6 Boot Capture recordings, and console recordings in the same
+//! format ([`Writer`]).
 //!
 //! The iDRAC6 records the console during the last three boots. The web UI
 //! (`lastboot.html`) plays them with the Java viewer in "playback" mode. A
@@ -10,9 +11,11 @@
 //! Port of `com.avocent.kvm.d.a.a` (reader, mode 3), `com.avocent.kvm.d.f`
 //! (record) and `com.avocent.kvm.d.a.b` (timing) from the iDRAC6 viewer.
 
-use std::time::Duration;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use super::Framebuffer;
 use super::dvc::{self, DvcDecoder};
@@ -22,7 +25,9 @@ pub const RECORD_HEADER_LEN: usize = 20;
 /// The Java viewer never sleeps longer than this between two records; long
 /// pauses in the recording are cut short.
 pub const MAX_DELAY_MS: u64 = 1000;
-/// The web UI's `maxFileLength`: the viewer refuses to read more than this.
+/// The web UI's `maxFileLength`: the Java viewer reads no more than this of
+/// a boot capture. Console recordings made by idrac6-rs can be longer.
+#[allow(dead_code)]
 pub const MAX_FILE_LEN: usize = 2 * 1024 * 1024;
 
 /// The Video Packet type the records are decoded as. Playback always uses
@@ -88,7 +93,6 @@ impl Recording {
 /// 20 or one that runs past the end of the data. A file that does not start
 /// with a valid record is rejected.
 pub fn parse(data: &[u8]) -> Result<Recording> {
-    let data = &data[..data.len().min(MAX_FILE_LEN)];
     let mut rec = Recording::default();
     let mut off = 0usize;
     let mut last_ts: Option<u32> = None;
@@ -135,6 +139,74 @@ pub fn parse(data: &[u8]) -> Result<Recording> {
         bail!("not a boot capture recording (no valid records)");
     }
     Ok(rec)
+}
+
+/// One record in the file format: `len32 DEADBEEF ts32 w16 h16 flags x x x
+/// data`.
+pub fn encode_record(timestamp_ms: u32, width: u16, height: u16, begin: bool, end: bool, data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(RECORD_HEADER_LEN + data.len());
+    v.extend_from_slice(&((RECORD_HEADER_LEN + data.len()) as u32).to_be_bytes());
+    v.extend_from_slice(&MAGIC);
+    v.extend_from_slice(&timestamp_ms.to_be_bytes());
+    v.extend_from_slice(&width.to_be_bytes());
+    v.extend_from_slice(&height.to_be_bytes());
+    v.extend_from_slice(&[u8::from(begin) | (u8::from(end) << 1), 0, 0, 0]);
+    v.extend_from_slice(data);
+    v
+}
+
+/// Records a live console in the boot capture format, so the player (and
+/// the iDRAC's own Java viewer) can replay it.
+pub struct Writer {
+    out: std::io::BufWriter<std::fs::File>,
+    pub path: PathBuf,
+    start: Instant,
+    pub bytes: u64,
+    /// Packets of a type other than 15 bit DVC, which the format cannot
+    /// hold.
+    pub skipped: u64,
+    /// Writing failed (disk full, ...); nothing more is recorded.
+    pub error: Option<String>,
+}
+
+impl Writer {
+    pub fn create(path: &Path) -> Result<Writer> {
+        let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(Writer { out: std::io::BufWriter::new(f), path: path.to_path_buf(), start: Instant::now(), bytes: 0, skipped: 0, error: None })
+    }
+
+    /// Add one live Video Packet (message type and payload including the
+    /// 12 byte DVC sub-header).
+    pub fn packet(&mut self, msg_type: u8, payload: &[u8]) -> std::io::Result<()> {
+        if self.error.is_some() {
+            return Ok(());
+        }
+        if msg_type != MSG_TYPE || payload.len() < dvc::HEADER_LEN {
+            self.skipped += 1;
+            return Ok(());
+        }
+        let h = dvc::parse_header(payload);
+        let ts = self.start.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        let rec = encode_record(ts, h.width, h.height, h.begin, h.end, &payload[dvc::HEADER_LEN..]);
+        if let Err(e) = self.out.write_all(&rec) {
+            self.error = Some(e.to_string());
+            return Err(e);
+        }
+        self.bytes += rec.len() as u64;
+        Ok(())
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    pub fn finish(mut self) -> Result<(PathBuf, Duration, u64)> {
+        if let Some(e) = self.error.take() {
+            bail!("writing {} failed: {e}", self.path.display());
+        }
+        self.out.flush().with_context(|| format!("writing {}", self.path.display()))?;
+        Ok((self.path, self.start.elapsed(), self.bytes))
+    }
 }
 
 /// Steps through a recording, like the Java playback controls.
@@ -220,14 +292,34 @@ mod tests {
     use super::*;
 
     fn record(ts: u32, w: u16, h: u16, flags: u8, data: &[u8]) -> Vec<u8> {
-        let mut v = ((RECORD_HEADER_LEN + data.len()) as u32).to_be_bytes().to_vec();
-        v.extend_from_slice(&MAGIC);
-        v.extend_from_slice(&ts.to_be_bytes());
-        v.extend_from_slice(&w.to_be_bytes());
-        v.extend_from_slice(&h.to_be_bytes());
-        v.extend_from_slice(&[flags, 0, 0, 0]);
-        v.extend_from_slice(data);
+        let mut v = encode_record(ts, w, h, flags & 1 != 0, flags & 2 != 0, data);
+        v[16] = flags;
         v
+    }
+
+    #[test]
+    fn writer_round_trips_live_packets() {
+        let dir = std::env::temp_dir().join(format!("idrac6-rec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.dvcrec");
+        let mut w = Writer::create(&path).unwrap();
+        // A live packet: 12 byte sub-header (height, width, begin+end) + data.
+        let mut live = vec![0, 0, 0, 0, 0, 2, 0, 8, 3, 0, 0, 0];
+        live.extend_from_slice(&[0xFC, 0x00, 0x23]);
+        w.packet(MSG_TYPE, &live).unwrap();
+        w.packet(0x86, &live).unwrap();
+        let (_, _, bytes) = w.finish().unwrap();
+        let data = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(bytes as usize, data.len());
+        let r = parse(&data).unwrap();
+        assert_eq!(r.frames.len(), 1);
+        assert_eq!((r.frames[0].width, r.frames[0].height, r.frames[0].begin, r.frames[0].end), (8, 2, true, true));
+        // Decodes to the same picture as the live packet.
+        let (mut a, mut b) = (Framebuffer::default(), Framebuffer::default());
+        DvcDecoder::new().push_packet(MSG_TYPE, &live, &mut a).unwrap();
+        Player::new(r).step(&mut b).unwrap();
+        assert_eq!(a.pixels, b.pixels);
     }
 
     #[test]

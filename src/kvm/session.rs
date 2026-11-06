@@ -76,7 +76,12 @@ pub struct Shared {
     pub bytes_in: AtomicU64,
     pub frames: AtomicU64,
     pub server_id: Mutex<Option<String>>,
+    /// Console recording under way, if any. Shared with the GUI, which
+    /// passes the same one on to the next session after a reconnect.
+    pub recorder: Recorder,
 }
+
+pub type Recorder = Arc<Mutex<Option<crate::video::playback::Writer>>>;
 
 type Notify = Arc<dyn Fn() + Send + Sync>;
 
@@ -92,6 +97,12 @@ impl KvmSession {
     /// [`KvmEvent`]s; `notify` is called whenever there is something new
     /// (used to wake up the GUI).
     pub fn start(params: KvmParams, notify: Notify) -> KvmSession {
+        Self::start_with_recorder(params, notify, Recorder::default())
+    }
+
+    /// Like [`KvmSession::start`], recording video into `recorder` while it
+    /// holds a writer.
+    pub fn start_with_recorder(params: KvmParams, notify: Notify, recorder: Recorder) -> KvmSession {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (ev_tx, ev_rx) = mpsc::channel();
         let shared = Arc::new(Shared {
@@ -100,6 +111,7 @@ impl KvmSession {
             bytes_in: AtomicU64::new(0),
             frames: AtomicU64::new(0),
             server_id: Mutex::new(None),
+            recorder,
         });
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = Ctx {
@@ -535,6 +547,12 @@ impl VideoAssembler {
                 let mut fb = ctx.shared.fb.lock().unwrap();
                 let r = self.dvc.push_packet(t, &m.payload, &mut fb);
                 drop(fb);
+                if let Some(w) = ctx.shared.recorder.lock().unwrap().as_mut() {
+                    if let Err(e) = w.packet(t, &m.payload) {
+                        log::error!("recording: {e}");
+                        (ctx.notify)();
+                    }
+                }
                 match r {
                     Ok(true) => {
                         ctx.shared.frames.fetch_add(1, Ordering::Relaxed);

@@ -152,6 +152,14 @@ screens report 752×413, and the size changes when the OS switches mode.
 Records are decoded by the 15 bit colour decoder (`d.c`, i.e. as type
 `0x81`), with no checksum.
 
+### Console recordings
+
+idrac6-rs writes console recordings (`.dvcrec`) in the same format: each
+live `0x81` Video Packet becomes one record, with its sub-header's width,
+height and begin/end flags and the time since recording started. They can
+be longer than 2 MiB; the player reads the whole file. Packets of other
+types are not recorded (iDRAC6 only sends `0x81`).
+
 ### Timing and controls
 
 `com.avocent.kvm.d.a.b` sleeps `timestamp - previous timestamp` before
