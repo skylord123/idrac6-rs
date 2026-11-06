@@ -1,4 +1,6 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// Windows release builds are windowed programs without a console, unless
+// built with the `console` feature (idrac6-cli.exe).
+#![cfg_attr(all(windows, not(debug_assertions), not(feature = "console")), windows_subsystem = "windows")]
 //! idrac6: native virtual console, virtual media and web UI proxy for
 //! Dell iDRAC6.
 
@@ -42,16 +44,22 @@ ENVIRONMENT:
     IDRAC6_FFMPEG=<path>        FFmpeg to use for MP4 videos
     IDRAC6_SSH=<path>           ssh to use
     IDRAC6_CONFIG_DIR=<dir>     Use a different settings directory
+
+On Windows, run these as idrac6-cli (idrac6-cli.exe); idrac6.exe has no
+console.
 ";
 
 fn main() {
-    // Set OpenSSL up before anything else touches it, without its exit-time
-    // cleanup (background threads may still be using TLS when we exit).
     // Running as ssh's password helper?
     ssh::askpass_hook();
+    // Set OpenSSL up before anything else touches it, without its exit-time
+    // cleanup (background threads may still be using TLS when we exit).
     openssl::init();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,winit=warn,egui_glow=warn,glutin=warn")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if windowed_cli(args.first().map(String::as_str)) {
+        return;
+    }
     let r = match args.first().map(String::as_str) {
         None => gui::run(Box::new(gui::ManagerWindow::new())),
         Some("-h" | "--help" | "help") => {
@@ -105,6 +113,24 @@ fn main() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// The windowed Windows build can't print or read the terminal, so
+/// commands that need it point to idrac6-cli.exe. Returns true when it
+/// did.
+fn windowed_cli(cmd: Option<&str>) -> bool {
+    let windowed = cfg!(all(windows, not(debug_assertions), not(feature = "console")));
+    let terminal_only = matches!(cmd, Some("-h" | "--help" | "help" | "-V" | "--version" | "proxy" | "export" | "mount" | "ssh"));
+    if !(windowed && terminal_only) {
+        return false;
+    }
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Info)
+        .set_title("idrac6")
+        .set_description("idrac6.exe has no console. For command-line use run idrac6-cli.exe, which is installed next to it, for example:\n\nidrac6-cli --help")
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    true
 }
 
 /// `idrac6 export`: recording file to MP4.

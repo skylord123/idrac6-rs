@@ -15,6 +15,9 @@ default = []
 # Build OpenSSL from source and link it statically. Used for Windows and
 # portable release builds; Linux distro builds can use the system OpenSSL.
 vendored-openssl = ["openssl/vendored"]
+# Windows: build a console program (idrac6-cli.exe) instead of a windowed
+# one, so command-line use prints to the terminal and waits for it.
+console = []
 
 [dependencies]
 anyhow = "1"

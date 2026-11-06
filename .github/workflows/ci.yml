@@ -71,8 +71,22 @@ jobs:
         uses: ilammy/setup-nasm@v1
       - name: Test
         run: cargo test --features vendored-openssl
+      # Two programs: idrac6-cli.exe (console, for the command line), then
+      # idrac6.exe (windowed). The second build only relinks.
       - name: Build
-        run: cargo build --release --features vendored-openssl
+        shell: pwsh
+        run: |
+          cargo build --release --features vendored-openssl,console
+          if ($LASTEXITCODE -ne 0) { throw "console build failed" }
+          Copy-Item target/release/idrac6.exe target/release/idrac6-cli.exe
+          cargo build --release --features vendored-openssl
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+      - name: Check the command-line program
+        shell: pwsh
+        run: |
+          $out = & target/release/idrac6-cli.exe --version
+          if ($out -notmatch '^idrac6 \d') { throw "idrac6-cli --version printed '$out'" }
+          $out
       - name: Install Inno Setup
         shell: pwsh
         run: |
@@ -86,7 +100,7 @@ jobs:
         run: |
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           New-Item -ItemType Directory dist, pkg | Out-Null
-          Copy-Item target/release/idrac6.exe, README.md pkg/
+          Copy-Item target/release/idrac6.exe, target/release/idrac6-cli.exe, README.md pkg/
           Copy-Item LICENSE pkg/LICENSE.txt
           Compress-Archive -Path pkg/* -DestinationPath dist/idrac6-windows-x86_64.zip
           & C:\InnoSetup\ISCC.exe /Q "/DAppVersion=$version" packaging\windows\idrac6.iss
@@ -97,7 +111,9 @@ jobs:
         run: |
           $dir = "$env:RUNNER_TEMP\idrac6-install"
           Start-Process dist/idrac6-windows-x86_64-setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', "/DIR=$dir" -Wait
-          if (-not (Test-Path "$dir\idrac6.exe")) { throw "the installer did not install idrac6.exe" }
+          foreach ($f in 'idrac6.exe', 'idrac6-cli.exe') {
+            if (-not (Test-Path "$dir\$f")) { throw "the installer did not install $f" }
+          }
           Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait
       - uses: actions/upload-artifact@v4
         with:

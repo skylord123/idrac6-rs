@@ -40,6 +40,12 @@ Download the latest build from the
   Start menu entry (no admin rights needed; it installs for your user
   unless you choose all users). Or take `idrac6-windows-x86_64.zip`,
   unzip it anywhere and run `idrac6.exe`.
+
+  For the command line (`export`, `proxy`, `mount`, `ssh` and the others
+  below) use `idrac6-cli.exe`, which comes with both: `idrac6.exe` is a
+  windowed program and can't print to a terminal. Write `idrac6-cli`
+  wherever this README says `idrac6` on the command line. The installer
+  can add it to your PATH.
 - **Ubuntu / Debian**: `idrac6-amd64.deb`. Install it with
   `sudo apt install ./idrac6-amd64.deb`, then start *iDRAC6 Console* from
   your applications menu.
@@ -79,7 +85,10 @@ cargo deb --features vendored-openssl    # -> target/debian/idrac6_*.deb
 
 The RPM is built the same way with `cargo install cargo-generate-rpm`,
 `cargo build --release --features vendored-openssl` and `cargo
-generate-rpm`. The Windows installer needs
+generate-rpm`. On Windows, `cargo build --release --features
+vendored-openssl,console` builds the command-line program; copy it to
+`target\release\idrac6-cli.exe` before building `idrac6.exe` (without
+`console`). The Windows installer needs
 [Inno Setup](https://jrsoftware.org/isinfo.php) 6.3 or newer: build the
 release executable, then run `iscc /DAppVersion=X.Y.Z
 packaging\windows\idrac6.iss` (it is written to `target\installer\`).
