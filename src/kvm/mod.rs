@@ -3,3 +3,4 @@
 pub mod keymap;
 pub mod proto;
 pub mod session;
+pub mod typer;

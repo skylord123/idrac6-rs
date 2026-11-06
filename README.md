@@ -71,6 +71,10 @@ slow.
 - Keys your desktop keeps for itself (Alt-Tab, the Windows key, Ctrl-Alt-Fn
   on Linux) can be sent from **Keyboard → Macros**. **Keyboard → Linux
   SysRq** has the magic SysRq combinations.
+- **Keyboard → Type text…** types text on the server as keystrokes, for
+  long passwords, recovery keys or commands. It opens with your clipboard
+  text. Characters are typed as on a US keyboard; use the *Slow* speed for
+  BIOS screens and boot loaders that drop keys.
 - If a key seems stuck on the server, use **Keyboard → Release all keys**.
   Keys are released automatically when the window loses focus.
 - **Power** has On, Off, Reset, Power Cycle and Graceful Shutdown. Each

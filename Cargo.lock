@@ -1162,6 +1162,7 @@ name = "idrac6"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "directories",
  "egui",
  "egui-winit",

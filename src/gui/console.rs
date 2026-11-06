@@ -19,6 +19,7 @@ use crate::config::Instance;
 use crate::kvm::keymap::{self, Macro};
 use crate::kvm::proto::{self, Bandwidth, PowerAction, SharingAnswer, buttons};
 use crate::kvm::session::{KvmEvent, KvmSession, VideoState};
+use crate::kvm::typer::{self, Speed, TypeJob};
 use crate::web::{ConsoleInfo, WebSession};
 
 enum Phase {
@@ -73,6 +74,10 @@ pub struct ConsoleWindow {
     show_stats: bool,
     stats: Stats,
     vm: VmPanel,
+    /// "Type text" dialog: the text to type.
+    type_text: Option<String>,
+    type_speed: Speed,
+    typing: Option<TypeJob>,
 }
 
 #[derive(Default)]
@@ -144,6 +149,9 @@ impl ConsoleWindow {
             show_stats: false,
             stats: Stats::default(),
             vm: VmPanel::new(),
+            type_text: None,
+            type_speed: Speed::Normal,
+            typing: None,
         }
     }
 
@@ -208,6 +216,67 @@ impl ConsoleWindow {
             for k in keys {
                 s.key(k, false);
             }
+        }
+    }
+
+    fn open_type_dialog(&mut self) {
+        let clip = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+        self.type_text = Some(clip);
+    }
+
+    fn start_typing(&mut self, text: &str) {
+        self.release_all_keys();
+        let Some(s) = self.session() else { return };
+        let job = TypeJob::start(s.sender(), text, self.type_speed, self.notifier());
+        self.typing = Some(job);
+    }
+
+    fn type_dialog(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.type_text.as_mut() else { return };
+        let mut go = false;
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique("type-text")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Type text");
+            ui.label("The text is typed on the server as keystrokes. Paste with Ctrl+V or edit it below.");
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                ui.add(egui::TextEdit::multiline(text).font(egui::TextStyle::Monospace).desired_rows(8).desired_width(f32::INFINITY).hint_text("Text to type"));
+            });
+            let chars = typer::normalize(text).chars().filter(|&c| typer::stroke(c).is_some()).count();
+            let lines = text.lines().count().max(1);
+            ui.weak(format!("{chars} character{}, {lines} line{}", plural(chars), plural(lines)));
+            let bad = typer::untypeable(text);
+            if !bad.is_empty() {
+                let list: String = bad.iter().take(12).map(|c| if c.is_control() { format!("U+{:04X} ", *c as u32) } else { format!("{c} ") }).collect();
+                ui.colored_label(ui.visuals().warn_fg_color, format!("Skipped (no key on a US keyboard): {}", list.trim_end()));
+            }
+            if self.leds.caps {
+                ui.colored_label(ui.visuals().warn_fg_color, "Caps Lock is on at the server, so letters may come out in the wrong case.");
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Speed");
+                for sp in Speed::ALL {
+                    ui.radio_value(&mut self.type_speed, sp, sp.label());
+                }
+            });
+            ui.weak("Typed as on a US keyboard; the server's layout decides what appears.");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(chars > 0, egui::Button::new("Type")).clicked() {
+                    go = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if go {
+            let t = self.type_text.take().unwrap_or_default();
+            self.start_typing(&t);
+        } else if close {
+            self.type_text = None;
         }
     }
 
@@ -370,6 +439,10 @@ impl ConsoleWindow {
             });
             ui.add_enabled_ui(self.can_input(), |ui| {
                 ui.menu_button("Keyboard", |ui| {
+                    if ui.button("Type text…").on_hover_text("Type text (e.g. from the clipboard) as keystrokes").clicked() {
+                        self.open_type_dialog();
+                    }
+                    ui.separator();
                     ui.checkbox(&mut self.capture_keys, "Send keystrokes to server")
                         .on_hover_text("When off, keys go to this window instead (useful to type in menus).");
                     if ui.button("Release all keys").on_hover_text("Fixes keys that appear stuck").clicked() {
@@ -799,6 +872,10 @@ impl ConsoleWindow {
     }
 }
 
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 fn power_label(state: u16) -> &'static str {
     match state {
         1 => "on",
@@ -863,6 +940,14 @@ impl WindowUi for ConsoleWindow {
                     ui.separator();
                     ui.label(format!("{:.1} fps, {:.0} kbit/s", self.stats.fps, self.stats.kbps));
                 }
+                if let Some(job) = &self.typing {
+                    ui.separator();
+                    let done = job.done();
+                    ui.add(egui::ProgressBar::new(done as f32 / job.total.max(1) as f32).desired_width(140.0).text(format!("Typing {done}/{}", job.total)));
+                    if ui.small_button("Stop").clicked() {
+                        job.cancel();
+                    }
+                }
                 if self.grabbed {
                     ui.separator();
                     ui.strong("Single cursor: press F9 to release the pointer");
@@ -874,6 +959,10 @@ impl WindowUi for ConsoleWindow {
         });
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::BLACK)).show(root, |ui| self.video(ui));
         self.dialogs(&ctx);
+        self.type_dialog(&ctx);
+        if self.typing.as_ref().is_some_and(|j| j.finished()) {
+            self.typing = None;
+        }
         if self.show_about {
             egui::Modal::new(egui::Id::unique("about")).show(&ctx, |ui| {
                 ui.heading(format!("idrac6 {}", env!("CARGO_PKG_VERSION")));
@@ -898,7 +987,7 @@ impl WindowUi for ConsoleWindow {
     fn raw_key(&mut self, ev: &KeyEvent) -> bool {
         // Keys go to the server while the pointer is over the video and no
         // dialog is open, like a KVM switch.
-        let modal_open = self.confirm_power.is_some() || self.sharing.is_some() || self.message.is_some() || self.show_about;
+        let modal_open = self.confirm_power.is_some() || self.sharing.is_some() || self.message.is_some() || self.show_about || self.type_text.is_some();
         // Over the Virtual Media window the keyboard belongs to egui.
         if !self.capture_keys || !self.can_input() || modal_open {
             return false;

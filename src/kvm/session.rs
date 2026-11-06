@@ -128,6 +128,12 @@ impl KvmSession {
         let _ = self.cmd_tx.send(msg);
     }
 
+    /// A handle to the command queue, for senders on other threads (e.g.
+    /// typing text). Sending fails once the session has ended.
+    pub fn sender(&self) -> Sender<Vec<u8>> {
+        self.cmd_tx.clone()
+    }
+
     /// Tell the iDRAC whether our window has the input focus, like the Java
     /// viewer does. Keyboard input may be ignored until focus is set.
     pub fn set_focus(&self, focused: bool) {
