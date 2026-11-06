@@ -104,7 +104,10 @@ impl Image {
         if size < 2048 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "ISO image is too small"));
         }
-        let blocks = (size / 2048).saturating_sub(1);
+        // The iDRAC treats this as the number of blocks. Dell's client sends
+        // size/2048 - 1, which hides the last 2 KiB of every ISO from the
+        // server; send the real count (a partial last block reads as zeros).
+        let blocks = size.div_ceil(2048);
         Ok(Image {
             backing,
             read_only: true,
@@ -274,7 +277,7 @@ mod tests {
         let mut v = vec![0u8; 2048 * 10];
         v[2048 * 3] = 7;
         let mut img = Image::iso(Box::new(io::Cursor::new(v))).unwrap();
-        assert_eq!(img.geometry.blocks, 9);
+        assert_eq!(img.geometry.blocks, 10);
         assert!(img.read_only);
         let d = img.read_blocks(3, 2).unwrap();
         assert_eq!(d.len(), 4096);

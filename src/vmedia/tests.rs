@@ -137,7 +137,7 @@ fn fake_idrac_session() {
         let map = read_packet_blocking(&mut s).unwrap();
         assert_eq!(proto::packet_type(&map), proto::ty::VDISK_REQUEST);
         assert_eq!(&map[10..12], &[0, 1]); // second slot is the CD
-        assert_eq!(be32(&map, 16), 31);
+        assert_eq!(be32(&map, 16), 32); // all 32 blocks of the 64 KiB ISO
 
         // Read 5 blocks from block 4 with blocking factor 2 -> 3 chunks.
         let mut body = vec![0, 1];
