@@ -10,6 +10,7 @@ use winit::dpi::LogicalSize;
 use winit::event_loop::EventLoopProxy;
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use super::health::HealthWindow;
 use super::monitor::{Monitor, MonitorState};
 use super::playback::PlaybackWindow;
 use super::{ConsoleWindow, Shell, UserEvent, WindowUi};
@@ -46,6 +47,7 @@ pub struct ManagerWindow {
 enum Open {
     Console,
     BootCaptures,
+    Health,
     Power(PowerAction),
     Identify(u8),
 }
@@ -115,6 +117,11 @@ impl ManagerWindow {
         match what {
             Open::Console => shell.open.push(Box::new(ConsoleWindow::new(inst))),
             Open::BootCaptures => shell.open.push(Box::new(PlaybackWindow::new(inst))),
+            Open::Health => {
+                if let Some(m) = self.monitor(idx) {
+                    shell.open.push(Box::new(HealthWindow::new(inst, m.client.clone())));
+                }
+            }
             Open::Power(a) => {
                 if let Some(m) = self.monitor(idx) {
                     m.power(a);
@@ -342,6 +349,9 @@ impl ManagerWindow {
                         if ui.button(label).on_hover_text("Open the iDRAC web interface through a local TLS proxy").clicked() {
                             action = Some(Action::Proxy);
                         }
+                        if ui.button("Health").on_hover_text("Sensors, power use and the System Event Log").clicked() {
+                            action = Some(Action::Health);
+                        }
                         if ui.button("Boot captures").on_hover_text("Replay the server's last boot cycles recorded by the iDRAC").clicked() {
                             action = Some(Action::Captures);
                         }
@@ -500,6 +510,7 @@ impl ManagerWindow {
 enum Action {
     Console,
     Proxy,
+    Health,
     Captures,
     Power(PowerAction),
     Identify(u8),
@@ -687,6 +698,7 @@ impl WindowUi for ManagerWindow {
             match action {
                 Some((i, Action::Console)) => self.act_or_prompt(i, Open::Console, shell),
                 Some((i, Action::Captures)) => self.act_or_prompt(i, Open::BootCaptures, shell),
+                Some((i, Action::Health)) => self.act_or_prompt(i, Open::Health, shell),
                 Some((i, Action::Proxy)) => self.toggle_proxy(i),
                 Some((i, Action::Power(a))) => self.confirm_power = Some((i, a)),
                 Some((i, Action::Identify(s))) => self.act_or_prompt(i, Open::Identify(s), shell),

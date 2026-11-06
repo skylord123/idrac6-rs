@@ -10,6 +10,7 @@ servers (PowerEdge R610, R710, T610 and friends), without Java.
   server as a USB CD/DVD or disk.
 - **Web UI proxy**: open the iDRAC web interface in a modern browser. The
   proxy talks the iDRAC's TLS 1.0 for you.
+- **Health**: sensors, power use and the System Event Log.
 - One window to manage all your iDRACs, with each server's power state,
   health, temperature, power use and a picture of its screen. Power
   control and the identify LED right from the list. Runs on Linux and
@@ -76,6 +77,13 @@ picture to open the console; hover it to see it larger.
 - **Options** turns the live status or the screen pictures off, for
   example on a slow link. idrac6-rs keeps one web session per iDRAC open
   for this and logs out when you quit.
+
+### Health
+
+Click **Health** for the server's details, every sensor with its limits,
+power use over the last minute, hour, day and week with peaks and energy
+used, and the System Event Log. The log can be filtered by severity,
+searched, saved as CSV and cleared.
 
 ### Virtual console
 
@@ -218,7 +226,7 @@ Code layout:
 ```text
 src/
   main.rs        command line
-  gui/           windows (winit + egui): manager, console, virtual media
+  gui/           windows (winit + egui): manager, console, health, virtual media
   kvm/           console protocol: messages, session, keyboard map
   video/dvc.rs   DVC video decoder (what iDRAC6 sends)
   video/playback.rs  boot capture recordings

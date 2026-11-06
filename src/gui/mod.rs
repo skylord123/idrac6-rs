@@ -6,6 +6,7 @@
 
 mod clipboard;
 mod console;
+mod health;
 mod manager;
 mod monitor;
 mod playback;
