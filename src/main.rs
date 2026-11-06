@@ -5,6 +5,7 @@
 mod config;
 mod gui;
 mod kvm;
+mod mount;
 mod proxy;
 mod tls;
 mod video;
@@ -18,6 +19,9 @@ USAGE:
     idrac6                      Open the console manager (GUI)
     idrac6 console <name|host> Open the console of a saved iDRAC directly
     idrac6 captures <name|host> Replay the boot recordings of a saved iDRAC
+    idrac6 mount <name|host> <image> [--read-write]
+                                Attach an .iso (CD/DVD) or .img (disk) as
+                                virtual media until Enter is pressed
     idrac6 proxy <host> [--port <local-port>] [--https-port <port>]
                                 Run only the web UI proxy, without a GUI
     idrac6 --help | --version
@@ -44,15 +48,7 @@ fn main() {
         Some(cmd @ ("console" | "captures")) => {
             let want = args.get(1).ok_or_else(|| anyhow::anyhow!("usage: idrac6 {cmd} <name|host>"));
             want.and_then(|want| {
-                let cfg = config::Config::load();
-                let inst = cfg
-                    .instances
-                    .into_iter()
-                    .find(|i| i.name.eq_ignore_ascii_case(want) || i.host == *want)
-                    .ok_or_else(|| anyhow::anyhow!("no saved iDRAC called '{want}'"))?;
-                if inst.password.is_empty() {
-                    anyhow::bail!("'{want}' has no saved password; open it from the manager instead");
-                }
+                let inst = find_instance(want)?;
                 if cmd == "console" {
                     gui::run(Box::new(gui::ConsoleWindow::new(inst)))
                 } else {
@@ -60,12 +56,32 @@ fn main() {
                 }
             })
         }
+        Some("mount") => (|| {
+            let (Some(want), Some(image)) = (args.get(1), args.get(2)) else {
+                anyhow::bail!("usage: idrac6 mount <name|host> <image> [--read-write]");
+            };
+            let inst = find_instance(want)?;
+            mount::run(inst, image.into(), None, args.iter().any(|a| a == "--read-write"))
+        })(),
         Some(other) => Err(anyhow::anyhow!("unknown command '{other}'\n\n{USAGE}")),
     };
     if let Err(e) = r {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// Look up a saved iDRAC by name or address; it must have a saved password.
+fn find_instance(want: &str) -> anyhow::Result<config::Instance> {
+    let inst = config::Config::load()
+        .instances
+        .into_iter()
+        .find(|i| i.name.eq_ignore_ascii_case(want) || i.host == want)
+        .ok_or_else(|| anyhow::anyhow!("no saved iDRAC called '{want}'"))?;
+    if inst.password.is_empty() {
+        anyhow::bail!("'{want}' has no saved password; open it from the manager instead");
+    }
+    Ok(inst)
 }
 
 fn run_proxy(args: &[String]) -> anyhow::Result<()> {

@@ -101,6 +101,20 @@ Media**, then **Map image…** next to *Virtual CD/DVD* (an `.iso`) or
 boot from (choose it in the boot menu with F11). Keep the console window
 open while the image is in use.
 
+Without the GUI, for example from a script:
+
+```sh
+idrac6 mount "R710 lab" ubuntu.iso          # CD/DVD, read-only
+idrac6 mount "R710 lab" disk.img --read-write
+```
+
+The image stays attached until you press Enter.
+
+If you get "no free virtual drive", Virtual Media is probably set to
+*Detached* on the iDRAC. Set it to *Auto-attach* under System → Console/Media
+→ Configuration, or with `racadm config -g cfgRacVirtual -o
+cfgVirMediaAttached 2`.
+
 ### Boot captures
 
 iDRAC6 records the server's screen during its last three boots. Click
@@ -187,10 +201,11 @@ src/
 ## Status
 
 New and still being tested. Tested on an iDRAC6 in a PowerEdge R710: web
-proxy, console video, keyboard, and boot capture playback. The video and
+proxy, console video, keyboard, boot capture playback, and Virtual Media
+(ISO read back byte for byte, writes to a disk image). The video and
 playback decoders match the original Java viewer pixel for pixel on real
-recordings. Virtual Media and single cursor mode were built from the
-reverse-engineered protocol and need more real-world testing. Bug reports
+recordings. Single cursor mode was built from the reverse-engineered
+protocol and needs more real-world testing. Bug reports
 with a `RUST_LOG=debug` log are very welcome (set `IDRAC6_CAPTURE=<file>`
 to also record the video stream).
 
