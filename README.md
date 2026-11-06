@@ -6,8 +6,8 @@ servers (PowerEdge R610, R710, T610 and friends), without Java.
 - **Virtual console**: see the server's screen, use keyboard and mouse,
   send Ctrl-Alt-Del and other macros, power control, screenshots.
 - **Boot captures**: replay the iDRAC's recordings of the last boots.
-- **Recording**: record a console session to a file and replay it, and
-  export recordings and boot captures as MP4 videos.
+- **Recording**: record a console session as an MP4 video or a raw
+  recording, and export recordings and boot captures as MP4.
 - **Virtual Media**: attach an ISO or disk image from your computer to the
   server as a USB CD/DVD or disk.
 - **Web UI proxy**: open the iDRAC web interface in a modern browser. The
@@ -119,11 +119,14 @@ slow.
   mode* in an iDRAC's settings to make that the default.
 - **File → Save screenshot** saves a PNG; **File → Copy screenshot** puts
   it on the clipboard.
-- **File → Start recording…** records the screen to a `.dvcrec` file until
-  you stop it (click the red *REC* timer). Replay it with **Open
-  recording…** in the main window or `idrac6 play <file>`. Recordings use
-  the iDRAC's boot capture format, so long idle stretches play back in a
-  second.
+- **File → Record video (MP4)…** records the screen as an MP4 video until
+  you stop it (click the red *REC* timer). It is recorded as a `.dvcrec`
+  first and turned into the MP4 when you stop, which takes a few seconds;
+  if that fails, the `.dvcrec` is kept. Needs FFmpeg.
+- **File → Record raw (.dvcrec)…** records the iDRAC's own screen data:
+  small files that play in idrac6-rs (**Open recording…** in the main
+  window or `idrac6 play <file>`), where long idle stretches play back in
+  a second, and can be exported to MP4 later.
 - **Tools → Mouse acceleration** should match the server's OS (Windows or
   Linux). A mismatch makes the server's pointer drift away from yours.
 - **Tools → Single cursor** hides your pointer and moves the server's pointer

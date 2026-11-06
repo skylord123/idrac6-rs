@@ -1,6 +1,7 @@
 //! Virtual console window.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -19,6 +20,8 @@ use crate::config::Instance;
 use crate::kvm::keymap::{self, Macro};
 use crate::kvm::proto::{self, Bandwidth, PowerAction, SharingAnswer, buttons};
 use crate::kvm::session::{KvmEvent, KvmSession, Recorder, VideoState};
+use super::mp4::{Choice, FfmpegDialog};
+use crate::video::mp4::{Export, Ffmpeg};
 use crate::video::playback::Writer;
 use crate::kvm::typer::{self, Speed, TypeJob};
 use crate::web::{ConsoleInfo, WebSession};
@@ -99,10 +102,32 @@ pub struct ConsoleWindow {
     old_webs: Arc<Mutex<Vec<Arc<WebSession>>>>,
     /// File → Start recording. Kept across reconnects.
     recorder: Recorder,
+    /// The current recording becomes this MP4 video when it stops (the
+    /// recorder writes a .dvcrec next to it first).
+    rec_video: Option<(PathBuf, Ffmpeg)>,
+    /// A stopped recording being turned into an MP4 video.
+    saving_video: Option<SavingVideo>,
+    ffmpeg_dialog: Option<FfmpegDialog>,
+    /// Close the window once the video is saved.
+    closing: bool,
     /// A finished recording to tell the user about.
-    saved_recording: Option<(std::path::PathBuf, Duration, u64)>,
+    saved_recording: Option<Saved>,
     /// Open the player for this file on the next frame.
     play_file: Option<std::path::PathBuf>,
+}
+
+struct SavingVideo {
+    job: Export,
+    /// The .dvcrec it is made from, deleted when the video is done.
+    raw: PathBuf,
+}
+
+#[derive(Clone)]
+struct Saved {
+    path: PathBuf,
+    len: Duration,
+    bytes: u64,
+    video: bool,
 }
 
 struct Notice {
@@ -224,6 +249,10 @@ impl ConsoleWindow {
             stale: false,
             old_webs: Arc::default(),
             recorder: Recorder::default(),
+            rec_video: None,
+            saving_video: None,
+            ffmpeg_dialog: None,
+            closing: false,
             saved_recording: None,
             play_file: None,
         }
@@ -458,6 +487,7 @@ impl ConsoleWindow {
         }
         let retrying = self.retry.is_some();
         let again = self.auto_reconnect
+            && !self.closing
             && match kind {
                 // The connection dropped (network, iDRAC reboot, idle
                 // timeout). Not when someone ended it on purpose: an admin,
@@ -560,12 +590,40 @@ impl ConsoleWindow {
         self.recorder.lock().unwrap().as_ref().map(Writer::elapsed)
     }
 
-    fn start_recording(&mut self) {
-        let name = format!("{}-{}.dvcrec", file_safe(self.inst.title()), timestamp());
-        let Some(path) = rfd::FileDialog::new().set_file_name(&name).add_filter("Console recording", &["dvcrec"]).save_file() else { return };
-        match Writer::create(&path) {
+    /// File → Record video (MP4) / Record raw (.dvcrec).
+    fn start_recording(&mut self, video: bool) {
+        let ff = if video {
+            match super::mp4::require() {
+                Ok(ff) => Some(ff),
+                Err(d) => {
+                    self.ffmpeg_dialog = Some(
+                        d.note("You can record as a .dvcrec file now instead, and export it to MP4 later from the player.")
+                            .alternative("Record .dvcrec instead"),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let stem = format!("{}-{}", file_safe(self.inst.title()), timestamp());
+        let dialog = match &ff {
+            Some(_) => rfd::FileDialog::new().set_file_name(format!("{stem}.mp4")).add_filter("MP4 video", &["mp4"]),
+            None => rfd::FileDialog::new().set_file_name(format!("{stem}.dvcrec")).add_filter("Console recording", &["dvcrec"]),
+        };
+        let Some(path) = dialog.save_file() else { return };
+        // A video is recorded as .dvcrec next to it, then converted.
+        let (raw, target) = match ff {
+            Some(ff) => {
+                let target = super::mp4::with_mp4_extension(path);
+                (unused_path(&target.with_extension("dvcrec")), Some((target, ff)))
+            }
+            None => (path, None),
+        };
+        match Writer::create(&raw) {
             Ok(w) => {
                 *self.recorder.lock().unwrap() = Some(w);
+                self.rec_video = target;
                 // Start with a complete picture.
                 if let Some(s) = self.session() {
                     s.refresh();
@@ -577,9 +635,52 @@ impl ConsoleWindow {
 
     fn stop_recording(&mut self) {
         let Some(w) = self.recorder.lock().unwrap().take() else { return };
-        match w.finish() {
-            Ok(r) => self.saved_recording = Some(r),
-            Err(e) => self.message = Some(format!("The recording could not be saved completely: {e:#}")),
+        let video = self.rec_video.take();
+        let (raw, len, bytes) = match w.finish() {
+            Ok(r) => r,
+            Err(e) => {
+                self.message = Some(format!("The recording could not be saved completely: {e:#}"));
+                return;
+            }
+        };
+        match video {
+            Some((target, ff)) => {
+                let src = raw.clone();
+                let load = move || {
+                    let data = std::fs::read(&src).map_err(|e| anyhow::anyhow!("could not read {}: {e}", src.display()))?;
+                    crate::video::playback::parse(&data)
+                };
+                self.saving_video = Some(SavingVideo { job: Export::start(ff, load, target, self.notifier()), raw });
+            }
+            None => self.saved_recording = Some(Saved { path: raw, len, bytes, video: false }),
+        }
+    }
+
+    /// Check on the MP4 being made from a stopped recording.
+    fn poll_saving_video(&mut self) {
+        let Some(sv) = self.saving_video.as_mut() else { return };
+        let Some(r) = sv.job.poll().cloned() else { return };
+        let cancelled = sv.job.was_cancelled();
+        let sv = self.saving_video.take().expect("saving");
+        match r {
+            Ok(done) => {
+                let _ = std::fs::remove_file(&sv.raw);
+                if !self.closing {
+                    self.saved_recording = Some(Saved { path: done.path, len: done.duration, bytes: done.bytes, video: true });
+                }
+            }
+            Err(_) if cancelled => {
+                self.message = Some(format!(
+                    "Making the video was cancelled. The recording was kept as {}; open it with Open recording to export it again.",
+                    sv.raw.display()
+                ));
+            }
+            Err(e) => {
+                self.message = Some(format!(
+                    "Could not make the MP4 video: {e}\n\nThe recording was kept as {}; open it with Open recording to try again.",
+                    sv.raw.display()
+                ));
+            }
         }
     }
 
@@ -619,12 +720,25 @@ impl ConsoleWindow {
                     if ui.button("Stop recording").clicked() {
                         self.stop_recording();
                     }
-                } else if ui
-                    .add_enabled(self.session().is_some(), egui::Button::new("Start recording…"))
-                    .on_hover_text("Record the screen to a file you can replay with Open recording")
-                    .clicked()
-                {
-                    self.start_recording();
+                } else {
+                    let can = self.session().is_some() && self.saving_video.is_none();
+                    if ui
+                        .add_enabled(can, egui::Button::new("Record video (MP4)…"))
+                        .on_hover_text("Record the screen as an MP4 video that plays anywhere. Needs FFmpeg.")
+                        .on_disabled_hover_text("Wait until the last video is saved")
+                        .clicked()
+                    {
+                        self.start_recording(true);
+                    }
+                    if ui
+                        .add_enabled(can, egui::Button::new("Record raw (.dvcrec)…"))
+                        .on_hover_text(
+                            "Record the iDRAC's own screen data: small files that play in idrac6 (Open recording) and can be exported to MP4 later.",
+                        )
+                        .clicked()
+                    {
+                        self.start_recording(false);
+                    }
                 }
                 ui.separator();
                 if ui.button("Reconnect").clicked() {
@@ -780,13 +894,26 @@ impl ConsoleWindow {
                         self.set_user_view_only(false);
                     }
                 }
+                if self.saving_video.is_some() && !self.closing {
+                    ui.separator();
+                    let cancel = self.saving_video.as_ref().is_some_and(|sv| super::mp4::progress_line(ui, "Saving video", &sv.job));
+                    if cancel {
+                        if let Some(sv) = self.saving_video.as_mut() {
+                            sv.job.cancel();
+                        }
+                    }
+                }
                 if let Some(t) = self.recording() {
                     ui.separator();
                     let s = t.as_secs();
                     let red = egui::Color32::from_rgb(230, 70, 70);
                     let r = ui
                         .add(egui::Button::new(egui::RichText::new(format!("REC {}:{:02}", s / 60, s % 60)).color(red)).small())
-                        .on_hover_text("Recording the screen. Click to stop.");
+                        .on_hover_text(if self.rec_video.is_some() {
+                            "Recording an MP4 video. Click to stop."
+                        } else {
+                            "Recording the screen. Click to stop."
+                        });
                     ui.painter().circle_filled(egui::pos2(r.rect.left() - 8.0, r.rect.center().y), 4.0, red);
                     ui.add_space(14.0);
                     if r.clicked() {
@@ -1216,24 +1343,27 @@ impl ConsoleWindow {
                 self.sharing = None;
             }
         }
-        if let Some((path, len, bytes)) = self.saved_recording.clone() {
+        if let Some(saved) = self.saved_recording.clone() {
             let mut close = false;
             egui::Modal::new(egui::Id::unique("rec-saved")).show(ctx, |ui| {
                 ui.set_max_width(460.0);
-                ui.heading("Recording saved");
+                ui.heading(if saved.video { "Video saved" } else { "Recording saved" });
                 ui.add_space(4.0);
-                let s = len.as_secs();
-                ui.label(format!("{}:{:02} recorded, {:.1} MB.", s / 60, s % 60, bytes as f64 / 1_000_000.0));
-                ui.weak(path.display().to_string());
+                ui.label(format!("{} recorded.", super::mp4::describe(saved.len, saved.bytes)));
+                ui.weak(saved.path.display().to_string());
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Play").clicked() {
-                        self.play_file = Some(path.clone());
-                        close = true;
-                    }
-                    if ui.button("Show folder").clicked() {
-                        if let Some(dir) = path.parent() {
-                            let _ = open::that(dir);
+                    if saved.video {
+                        super::mp4::open_buttons(ui, &saved.path);
+                    } else {
+                        if ui.button("Play").clicked() {
+                            self.play_file = Some(saved.path.clone());
+                            close = true;
+                        }
+                        if ui.button("Show folder").clicked() {
+                            if let Some(dir) = saved.path.parent() {
+                                let _ = open::that(dir);
+                            }
                         }
                     }
                     if ui.button("OK").clicked() {
@@ -1245,14 +1375,48 @@ impl ConsoleWindow {
                 self.saved_recording = None;
             }
         }
+        if let Some(d) = self.ffmpeg_dialog.as_mut() {
+            match d.show(ctx) {
+                None => {}
+                Some(c) => {
+                    self.ffmpeg_dialog = None;
+                    match c {
+                        Choice::Found(_) => self.start_recording(true),
+                        Choice::Alternative => self.start_recording(false),
+                        Choice::Close => {}
+                    }
+                }
+            }
+        }
+        if self.closing {
+            if let Some(sv) = self.saving_video.as_mut() {
+                let mut cancel = false;
+                egui::Modal::new(egui::Id::unique("closing-video")).show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.heading("Saving the video");
+                    ui.add_space(4.0);
+                    ui.label("The window closes when the MP4 video is saved.");
+                    ui.weak(sv.job.out.display().to_string());
+                    ui.add_space(6.0);
+                    ui.add(egui::ProgressBar::new(sv.job.progress()).show_percentage());
+                    ui.add_space(6.0);
+                    cancel = ui.button("Cancel").on_hover_text("Close now and keep the .dvcrec recording instead").clicked();
+                });
+                if cancel {
+                    sv.job.cancel();
+                }
+            }
+        }
         let write_error = self.recorder.lock().unwrap().as_ref().and_then(|w| w.error.clone());
         if let Some(e) = write_error {
             self.recorder.lock().unwrap().take();
+            self.rec_video = None;
             self.message = Some(format!("Recording stopped: {e}"));
         }
         if let Some(m) = self.message.clone() {
             let mut close = false;
             egui::Modal::new(egui::Id::unique("msg")).show(ctx, |ui| {
+                ui.set_max_width(480.0);
                 ui.label(m);
                 if ui.button("OK").clicked() {
                     close = true;
@@ -1299,6 +1463,16 @@ fn timestamp() -> String {
     format!("{y:04}-{m:02}-{d:02}_{:02}{:02}{:02}", rem / 3600, rem / 60 % 60, rem % 60)
 }
 
+/// `path`, or `name-2.ext`, `name-3.ext`, ... if it exists already.
+fn unused_path(path: &std::path::Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (1..)
+        .map(|i| if i == 1 { path.to_path_buf() } else { path.with_file_name(format!("{stem}-{i}{ext}")) })
+        .find(|p| !p.exists())
+        .expect("a free name")
+}
+
 pub(super) fn file_safe(name: &str) -> String {
     name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '.', "_")
 }
@@ -1319,6 +1493,10 @@ impl WindowUi for ConsoleWindow {
     fn ui(&mut self, root: &mut egui::Ui, window: &Window, shell: &mut Shell) {
         let ctx = root.ctx().clone();
         self.poll();
+        self.poll_saving_video();
+        if self.closing && self.saving_video.is_none() && self.message.is_none() {
+            shell.close_me = true;
+        }
         self.drive_retry(&ctx);
         if self.session().is_none() && self.grabbed {
             self.want_grab = Some(false);
@@ -1415,7 +1593,9 @@ impl WindowUi for ConsoleWindow {
             || self.message.is_some()
             || self.show_about
             || self.type_text.is_some()
-            || self.saved_recording.is_some();
+            || self.saved_recording.is_some()
+            || self.ffmpeg_dialog.is_some()
+            || self.closing;
         // Over the Virtual Media window the keyboard belongs to egui.
         if !self.capture_keys || !self.can_input() || modal_open {
             return false;
@@ -1471,18 +1651,38 @@ impl WindowUi for ConsoleWindow {
     }
 
     fn close_requested(&mut self) -> bool {
-        if let Some(w) = self.recorder.lock().unwrap().take() {
+        if self.closing {
+            // Asked again while the video is saved: keep waiting; the
+            // dialog has Cancel.
+            return self.saving_video.is_none();
+        }
+        if self.rec_video.is_some() {
+            self.stop_recording();
+        } else if let Some(w) = self.recorder.lock().unwrap().take() {
             if let Err(e) = w.finish() {
                 log::error!("{e:#}");
             }
         }
+        if self.saving_video.is_some() {
+            // Disconnect now, close once the video is saved.
+            self.closing = true;
+            self.retry = None;
+            self.disconnect_all();
+            return false;
+        }
+        self.disconnect_all();
+        // The web session is logged out in Drop.
+        true
+    }
+}
+
+impl ConsoleWindow {
+    fn disconnect_all(&mut self) {
         self.release_all_keys();
         self.vm.disconnect();
         if let Phase::Connected(s) = &self.phase {
             s.close();
         }
-        // The web session is logged out in Drop.
-        true
     }
 }
 
