@@ -184,10 +184,10 @@ pub struct Macro {
     pub keys: Vec<u16>,
 }
 
-/// The macros offered by the original iDRAC6 viewer.
+/// The macros offered by the original iDRAC6 viewer, in its order.
 pub fn macros() -> Vec<Macro> {
     use usage::*;
-    let mut v = vec![
+    vec![
         Macro { label: "Ctrl-Alt-Del", keys: vec![LCTRL, LALT, DELETE] },
         Macro { label: "Alt-Tab", keys: vec![LALT, TAB] },
         Macro { label: "Alt-Esc", keys: vec![LALT, ESC] },
@@ -200,14 +200,30 @@ pub fn macros() -> Vec<Macro> {
         Macro { label: "Alt-PrtScrn", keys: vec![LALT, PRINT_SCREEN] },
         Macro { label: "F1", keys: vec![f(1)] },
         Macro { label: "Pause", keys: vec![PAUSE] },
-        Macro { label: "Windows key", keys: vec![LGUI] },
-        Macro { label: "Ctrl-Alt-Backspace", keys: vec![LCTRL, LALT, BACKSPACE] },
+        Macro { label: "Tab", keys: vec![TAB] },
+        Macro { label: "Ctrl-Enter", keys: vec![LCTRL, ENTER] },
+        Macro { label: "SysRq", keys: vec![SYSRQ] },
+        Macro { label: "Alt-SysRq", keys: vec![LALT, SYSRQ] },
         Macro { label: "Alt-LShift-RShift-Esc", keys: vec![LALT, LSHIFT, RSHIFT, ESC] },
-    ];
-    for n in 1..=12 {
-        v.push(Macro { label: leak(format!("Ctrl-Alt-F{n}")), keys: vec![LCTRL, LALT, f(n)] });
-    }
-    v
+        Macro { label: "Ctrl-Alt-Backspace", keys: vec![LCTRL, LALT, BACKSPACE] },
+        Macro { label: "Ctrl-E (iDRAC setup at boot)", keys: vec![LCTRL, letter('e')] },
+        Macro { label: "Windows key", keys: vec![LGUI] },
+    ]
+}
+
+/// Alt-F1..F12 or Ctrl-Alt-F1..F12, the original's two macro submenus.
+pub fn function_key_macros(ctrl: bool) -> Vec<Macro> {
+    use usage::*;
+    (1..=12)
+        .map(|n| {
+            let (label, keys) = if ctrl {
+                (format!("Ctrl-Alt-F{n}"), vec![LCTRL, LALT, f(n)])
+            } else {
+                (format!("Alt-F{n}"), vec![LALT, f(n)])
+            };
+            Macro { label: leak(label), keys }
+        })
+        .collect()
 }
 
 /// Linux magic SysRq combinations (Alt+SysRq+<key>).

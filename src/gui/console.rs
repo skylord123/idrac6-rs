@@ -77,6 +77,16 @@ fn macros() -> &'static [Macro] {
     M.get_or_init(keymap::macros)
 }
 
+fn alt_f() -> &'static [Macro] {
+    static M: OnceLock<Vec<Macro>> = OnceLock::new();
+    M.get_or_init(|| keymap::function_key_macros(false))
+}
+
+fn ctrl_alt_f() -> &'static [Macro] {
+    static M: OnceLock<Vec<Macro>> = OnceLock::new();
+    M.get_or_init(|| keymap::function_key_macros(true))
+}
+
 fn sysrq() -> &'static [Macro] {
     static M: OnceLock<Vec<Macro>> = OnceLock::new();
     M.get_or_init(keymap::sysrq_macros)
@@ -345,6 +355,16 @@ impl ConsoleWindow {
                             if ui.button(m.label).clicked() {
                                 self.send_macro(m);
                             }
+                        }
+                        ui.separator();
+                        for (label, list) in [("Alt-F?", alt_f()), ("Ctrl-Alt-F?", ctrl_alt_f())] {
+                            ui.menu_button(label, |ui| {
+                                for m in list {
+                                    if ui.button(m.label).clicked() {
+                                        self.send_macro(m);
+                                    }
+                                }
+                            });
                         }
                     });
                     ui.menu_button("Linux SysRq", |ui| {
