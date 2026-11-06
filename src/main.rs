@@ -4,6 +4,7 @@
 
 mod config;
 mod gui;
+mod health;
 mod kvm;
 mod mount;
 mod proxy;

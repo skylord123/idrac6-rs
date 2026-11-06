@@ -10,7 +10,10 @@ servers (PowerEdge R610, R710, T610 and friends), without Java.
   server as a USB CD/DVD or disk.
 - **Web UI proxy**: open the iDRAC web interface in a modern browser. The
   proxy talks the iDRAC's TLS 1.0 for you.
-- One window to manage all your iDRACs. Runs on Linux and Windows.
+- One window to manage all your iDRACs, with each server's power state,
+  health, temperature, power use and a picture of its screen. Power
+  control and the identify LED right from the list. Runs on Linux and
+  Windows.
 - Written in Rust. A single executable, no Java, starts instantly.
 
 ## Why
@@ -58,6 +61,21 @@ cargo deb --features vendored-openssl    # -> target/debian/idrac6_*.deb
 
 Start `idrac6`, click **Add iDRAC**, and enter the address, user and
 password (the same ones you use for the iDRAC web page).
+
+### The server list
+
+Each iDRAC shows its power state, overall health (the coloured dot; hover
+it for details), inlet temperature, power use and a small picture of its
+screen, refreshed every 30 seconds (the picture every minute). Click the
+picture to open the console; hover it to see it larger.
+
+- **Power** turns the server on or off, resets it, power cycles it or
+  asks its OS to shut down. Each one asks for confirmation.
+- **More → Blink identify LED** makes the blue light on the server's front
+  blink for a minute, to find it in the rack.
+- **Options** turns the live status or the screen pictures off, for
+  example on a slow link. idrac6-rs keeps one web session per iDRAC open
+  for this and logs out when you quit.
 
 ### Virtual console
 
@@ -192,6 +210,7 @@ docs describe the formats:
 - [docs/video-dvc.md](docs/video-dvc.md): the Avocent DVC video codec iDRAC6 uses, and the boot capture file format
 - [docs/video-codec.md](docs/video-codec.md): the ASPEED video codec (supported, but not used by iDRAC6)
 - [docs/virtual-media.md](docs/virtual-media.md): Virtual Media protocol
+- [docs/web-api.md](docs/web-api.md): the web interface's data API (status, sensors, power, event log)
 - [docs/reverse-engineering.md](docs/reverse-engineering.md): how this was done and how to reproduce it
 
 Code layout:
@@ -206,6 +225,7 @@ src/
   video/aspeed.rs  ASPEED video decoder
   vmedia/        Virtual Media protocol and image serving
   web.rs         iDRAC web login and viewer.jnlp
+  health.rs      status, sensors, power and event log from the web API
   proxy.rs       HTTPS -> TLS 1.0 web proxy
   tls.rs         legacy TLS settings
 ```
@@ -217,7 +237,9 @@ proxy, console video, keyboard, boot capture playback, and Virtual Media
 (ISO read back byte for byte, writes to a disk image). The video and
 playback decoders match the original Java viewer pixel for pixel on real
 recordings. Single cursor mode was built from the reverse-engineered
-protocol and needs more real-world testing. Bug reports
+protocol and needs more real-world testing, as do power control from the
+server list and the identify LED (they send the same requests as the web
+interface's buttons). Bug reports
 with a `RUST_LOG=debug` log are very welcome (set `IDRAC6_CAPTURE=<file>`
 to also record the video stream).
 

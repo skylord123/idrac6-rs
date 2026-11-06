@@ -48,8 +48,25 @@ impl Instance {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub settings: Settings,
     #[serde(rename = "instance")]
     pub instances: Vec<Instance>,
+}
+
+/// App-wide options.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Settings {
+    /// Poll power state and sensor health for the manager window.
+    pub live_status: bool,
+    /// Also fetch a small picture of each server's screen.
+    pub screen_previews: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { live_status: true, screen_previews: true }
+    }
 }
 
 pub fn config_dir() -> PathBuf {

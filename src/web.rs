@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -100,13 +101,70 @@ fn form_escape(s: &str) -> String {
     o
 }
 
-fn xml_value<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+/// The trimmed text of the first `<tag>` element.
+pub fn xml_value<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)? + start;
     Some(xml[start..end].trim())
 }
+
+/// The contents of every `<tag>` element, in order. Elements of the same
+/// name must not nest (true for the iDRAC's data XML).
+pub fn xml_elements<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        rest = &rest[i + open.len()..];
+        let Some(end) = rest.find(&close) else { break };
+        out.push(&rest[..end]);
+        rest = &rest[end + close.len()..];
+    }
+    out
+}
+
+/// Decode the XML character entities the iDRAC uses.
+pub fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&#39;", "'").replace("&amp;", "&")
+}
+
+/// Why the iDRAC refused a web login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginRefused {
+    BadCredentials,
+    NotAllowed,
+    TooManySessions,
+}
+
+impl std::fmt::Display for LoginRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LoginRefused::BadCredentials => "Login failed: wrong username or password.",
+            LoginRefused::NotAllowed => "Login failed: this user is not allowed to log in.",
+            LoginRefused::TooManySessions => "Login failed: too many web sessions are open on the iDRAC. Close some or wait for them to time out.",
+        })
+    }
+}
+
+impl std::error::Error for LoginRefused {}
+
+/// The session expired or was closed on the iDRAC (HTTP 401).
+#[derive(Debug)]
+pub struct SessionExpired;
+
+impl std::fmt::Display for SessionExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the iDRAC web session expired")
+    }
+}
+
+impl std::error::Error for SessionExpired {}
 
 /// A logged-in web session.
 pub struct WebSession {
@@ -138,9 +196,9 @@ impl WebSession {
         }
         match xml_value(&text, "authResult") {
             Some("0") => {}
-            Some("1") => bail!("Login failed: wrong username or password."),
-            Some("4") => bail!("Login failed: this user is not allowed to log in."),
-            Some("5") => bail!("Login failed: too many web sessions are open on the iDRAC. Close some or wait for them to time out."),
+            Some("1") => return Err(LoginRefused::BadCredentials.into()),
+            Some("4") => return Err(LoginRefused::NotAllowed.into()),
+            Some("5") => return Err(LoginRefused::TooManySessions.into()),
             other => bail!("Login failed (authResult {}).", other.unwrap_or("?")),
         }
         let cookie = r
@@ -170,6 +228,31 @@ impl WebSession {
             h.push(("ST2", st2));
         }
         request(&self.host, self.port, "GET", path, &h, None)
+    }
+
+    /// Fetch `/data?get=<fields>` (comma separated) and return the XML.
+    pub fn data(&self, fields: &str) -> Result<String> {
+        let r = self.get(&format!("/data?get={fields}"))?;
+        if r.status == 401 {
+            return Err(SessionExpired.into());
+        }
+        if r.status != 200 {
+            bail!("reading {fields} returned HTTP {}", r.status);
+        }
+        Ok(r.text())
+    }
+
+    /// `/data?set=<key:value,...>`: change a setting or run an action.
+    pub fn set(&self, assignments: &str) -> Result<String> {
+        let r = self.get(&format!("/data?set={assignments}"))?;
+        if r.status == 401 {
+            return Err(SessionExpired.into());
+        }
+        let text = r.text();
+        if r.status != 200 || xml_value(&text, "status").is_some_and(|s| s != "ok") {
+            bail!("the iDRAC refused {assignments} (HTTP {}): {}", r.status, xml_value(&text, "status").unwrap_or(""));
+        }
+        Ok(text)
     }
 
     /// Download the virtual console launch file and extract the session
@@ -224,6 +307,127 @@ impl WebSession {
             Err(e) => {
                 log::debug!("logout failed: {e:#}");
                 false
+            }
+        }
+    }
+}
+
+/// A web login that is kept open and reused, and renewed when it expires.
+/// Used for status polling and the health and power features, which make
+/// many small requests: logging in for each would be slow (the iDRAC6
+/// takes about a second per login) and churn through its few sessions.
+pub struct WebClient {
+    pub host: String,
+    pub port: u16,
+    user: String,
+    password: Mutex<String>,
+    session: Mutex<Option<Arc<WebSession>>>,
+    last_use: Mutex<Instant>,
+    /// Set by [`WebClient::shutdown`]: no more logins.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl WebClient {
+    pub fn new(host: &str, port: u16, user: &str, password: &str) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            user: user.into(),
+            password: Mutex::new(password.into()),
+            session: Mutex::new(None),
+            last_use: Mutex::new(Instant::now()),
+            closed: Default::default(),
+        }
+    }
+
+    pub fn has_password(&self) -> bool {
+        !self.password.lock().unwrap().is_empty()
+    }
+
+    pub fn password(&self) -> String {
+        self.password.lock().unwrap().clone()
+    }
+
+    pub fn set_password(&self, password: &str) {
+        *self.password.lock().unwrap() = password.into();
+    }
+
+    fn session(&self) -> Result<Arc<WebSession>> {
+        // Held while logging in, so parallel callers share one login.
+        let mut s = self.session.lock().unwrap();
+        if let Some(w) = s.as_ref() {
+            return Ok(w.clone());
+        }
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("closing");
+        }
+        let pw = self.password.lock().unwrap().clone();
+        let w = Arc::new(WebSession::login(&self.host, self.port, &self.user, &pw)?);
+        *s = Some(w.clone());
+        Ok(w)
+    }
+
+    /// Run `f` with a logged-in session, logging in again once if the
+    /// session turns out to have expired.
+    pub fn with<T>(&self, f: impl Fn(&WebSession) -> Result<T>) -> Result<T> {
+        *self.last_use.lock().unwrap() = Instant::now();
+        let w = self.session()?;
+        match f(&w) {
+            Err(e) if e.downcast_ref::<SessionExpired>().is_some() => {
+                log::debug!("web session on {} expired; logging in again", self.host);
+                {
+                    let mut s = self.session.lock().unwrap();
+                    if s.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &w)) {
+                        *s = None;
+                    }
+                }
+                f(&*self.session()?)
+            }
+            r => r,
+        }
+    }
+
+    pub fn data(&self, fields: &str) -> Result<String> {
+        self.with(|w| w.data(fields))
+    }
+
+    pub fn set(&self, assignments: &str) -> Result<String> {
+        self.with(|w| w.set(assignments))
+    }
+
+    pub fn get(&self, path: &str) -> Result<Response> {
+        self.with(|w| {
+            let r = w.get(path)?;
+            if r.status == 401 {
+                return Err(SessionExpired.into());
+            }
+            Ok(r)
+        })
+    }
+
+    pub fn logged_in(&self) -> bool {
+        self.session.lock().unwrap().is_some()
+    }
+
+    pub fn idle_for(&self) -> Duration {
+        self.last_use.lock().unwrap().elapsed()
+    }
+
+    /// Log out for good: requests still under way fail instead of logging
+    /// in again.
+    pub fn shutdown(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.logout();
+    }
+
+    /// Log out if logged in.
+    pub fn logout(&self) {
+        let w = self.session.lock().unwrap().take();
+        if let Some(w) = w {
+            if w.logout() {
+                log::debug!("logged out of {}", self.host);
+            } else {
+                log::warn!("could not log out of {}; the session stays open until it times out", self.host);
             }
         }
     }
@@ -327,6 +531,14 @@ mod tests {
         assert_eq!(xml_value(x, "bootCapCount"), Some("2"));
         assert_eq!(xml_value(x, "bootCapFname0"), Some("bootcapture_2"));
         assert_eq!(xml_value(x, "missing"), None);
+    }
+
+    #[test]
+    fn xml_lists_and_entities() {
+        let x = "<a><s><n>1</n></s><s><n>2 &amp; 3</n></s></a>";
+        let items: Vec<String> = xml_elements(x, "s").iter().map(|s| xml_unescape(xml_value(s, "n").unwrap())).collect();
+        assert_eq!(items, vec!["1", "2 & 3"]);
+        assert!(xml_elements(x, "none").is_empty());
     }
 
     #[test]

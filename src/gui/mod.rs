@@ -7,6 +7,7 @@
 mod clipboard;
 mod console;
 mod manager;
+mod monitor;
 mod playback;
 mod vmedia;
 
@@ -217,6 +218,9 @@ impl App {
 
     fn close(&mut self, el: &ActiveEventLoop, id: WindowId) {
         if let Some(mut w) = self.windows.remove(&id) {
+            // Dropping the UI can take a moment (logging out of iDRACs);
+            // make the window disappear right away.
+            w.window.set_visible(false);
             let _ = w.context.make_current(&w.surface);
             w.egui.destroy();
             if w.ui.is_main() {
@@ -333,6 +337,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         for (_, mut w) in self.windows.drain() {
+            w.window.set_visible(false);
             let _ = w.context.make_current(&w.surface);
             w.egui.destroy();
         }
