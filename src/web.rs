@@ -290,7 +290,7 @@ impl WebSession {
             .collect())
     }
 
-    /// Download one boot recording (at most 2 MiB).
+    /// Download one boot recording (the iDRAC keeps them at 2 MiB or less).
     pub fn download_boot_capture(&self, c: &BootCapture) -> Result<Vec<u8>> {
         let r = self.get(&format!("/captures/{}", c.file))?;
         if r.status != 200 {

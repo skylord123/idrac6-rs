@@ -2,6 +2,7 @@
 name = "idrac6"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "Native virtual console (KVM), virtual media and web UI proxy for Dell iDRAC6"
 license = "MIT"
 readme = "README.md"

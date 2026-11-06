@@ -62,7 +62,7 @@ Gyan.FFmpeg` on Windows (or put `ffmpeg.exe` next to `idrac6.exe`).
 Everything else works without it, and idrac6-rs tells you when it's
 missing.
 
-Or build it yourself (Rust 1.85 or newer):
+Or build it yourself (Rust 1.95 or newer):
 
 ```sh
 git clone https://github.com/skylord123/idrac6-rs
@@ -229,12 +229,15 @@ Click **Web UI**. This starts a local proxy and opens
 warns about the certificate. It's a self-signed certificate made by
 idrac6-rs for `localhost`; accept it once.
 
-You can also run only the proxy, without a GUI (for example on a jump
-host):
+You can also run only the proxy, without a GUI:
 
 ```sh
 idrac6 proxy 192.168.1.120 --port 8443
 ```
+
+It only listens on `localhost`. To use it from another computer, for
+example when it runs on a jump host, forward the port over SSH:
+`ssh -L 8443:localhost:8443 jumphost`, then open `https://localhost:8443/`.
 
 The proxy allows at most two connections to the iDRAC at a time. The
 iDRAC6 web server locks up for minutes when a browser opens its usual six
