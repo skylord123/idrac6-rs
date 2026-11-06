@@ -24,6 +24,8 @@ pub struct Instance {
     pub proxy_port: u16,
     /// Open consoles with keyboard and mouse input turned off.
     pub view_only: bool,
+    /// SSH port of the iDRAC.
+    pub ssh_port: u16,
 }
 
 impl Default for Instance {
@@ -37,6 +39,7 @@ impl Default for Instance {
             save_password: true,
             proxy_port: 0,
             view_only: false,
+            ssh_port: 22,
         }
     }
 }
@@ -63,11 +66,15 @@ pub struct Settings {
     pub live_status: bool,
     /// Also fetch a small picture of each server's screen.
     pub screen_previews: bool,
+    /// Terminal program for SSH, with the option that runs a command
+    /// (e.g. "kitty" or "xterm -e"). Empty: pick one.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub terminal: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { live_status: true, screen_previews: true }
+        Self { live_status: true, screen_previews: true, terminal: String::new() }
     }
 }
 

@@ -24,6 +24,7 @@ use super::mp4::{Choice, FfmpegDialog};
 use crate::video::mp4::{Export, Ffmpeg};
 use crate::video::playback::Writer;
 use crate::kvm::typer::{self, Speed, TypeJob};
+use crate::ssh;
 use crate::web::{ConsoleInfo, WebSession};
 
 enum Phase {
@@ -833,8 +834,9 @@ impl ConsoleWindow {
             if ui.add_enabled(vm_ok, egui::Button::new("Virtual Media")).on_disabled_hover_text("Needs a connected console and the Virtual Media privilege").clicked() {
                 self.vm.open = true;
             }
-            ui.add_enabled_ui(self.session().is_some(), |ui| {
-                ui.menu_button("Tools", |ui| {
+            let connected = self.session().is_some();
+            ui.menu_button("Tools", |ui| {
+                ui.add_enabled_ui(connected, |ui| {
                     if ui
                         .checkbox(&mut self.single_cursor, "Single cursor")
                         .on_hover_text("Hide the local pointer and move the server's pointer directly. Click the screen to start, press F9 to release.")
@@ -870,6 +872,18 @@ impl ConsoleWindow {
                     ui.separator();
                     ui.checkbox(&mut self.show_stats, "Statistics");
                 });
+                ui.separator();
+                for (label, mode, tip) in [
+                    ("SSH command line", ssh::Mode::Shell, "Open the iDRAC's command line (racadm, SM-CLP) in a terminal"),
+                    ("Serial console", ssh::Mode::Serial, "The server's serial port (COM2) over SSH, in a terminal. Ctrl+\\ ends it."),
+                ] {
+                    if ui.button(label).on_hover_text(tip).clicked() {
+                        let terminal = crate::config::Config::load().settings.terminal;
+                        if let Err(e) = ssh::open_terminal(&self.inst, mode, &terminal) {
+                            self.message = Some(format!("Could not open SSH: {e:#}"));
+                        }
+                    }
+                }
             });
             ui.menu_button("Help", |ui| {
                 if ui.button("About").clicked() {

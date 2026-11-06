@@ -48,7 +48,7 @@ name = "idrac6"
 section = "net"
 priority = "optional"
 depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libegl1 | libgl1"
-recommends = "xdg-desktop-portal"
+recommends = "xdg-desktop-portal, openssh-client"
 suggests = "ffmpeg"
 extended-description = """\
 Native replacement for the Dell iDRAC6 Java virtual console. Shows the \

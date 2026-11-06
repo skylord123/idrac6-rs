@@ -13,6 +13,9 @@ servers (PowerEdge R610, R710, T610 and friends), without Java.
 - **Web UI proxy**: open the iDRAC web interface in a modern browser. The
   proxy talks the iDRAC's TLS 1.0 for you.
 - **Health**: sensors, power use and the System Event Log.
+- **SSH and serial console**: open the iDRAC's command line, or the
+  server's serial console (serial over LAN), in your terminal with one
+  click.
 - One window to manage all your iDRACs, with each server's power state,
   health, temperature, power use and a picture of its screen. Power
   control and the identify LED right from the list. Runs on Linux and
@@ -199,6 +202,38 @@ The proxy allows at most two connections to the iDRAC at a time. The
 iDRAC6 web server locks up for minutes when a browser opens its usual six
 at once.
 
+### SSH and serial console
+
+**More → SSH command line** opens a terminal logged in to the iDRAC's
+command line (SM-CLP, with `racadm`). **More → Serial console** connects
+straight to the server's serial port (COM2, serial over LAN); press
+**Ctrl+\\** to end it. Both are also in the console's **Tools** menu.
+
+The iDRAC6 only offers an old host key type (`ssh-rsa`) that current
+OpenSSH turns off, so plain `ssh` fails. idrac6 runs your `ssh` with it
+re-enabled, the saved user name and SSH port (set under **More → Edit**),
+and the saved password. The iDRAC's host key is kept in
+`ssh_known_hosts` in the settings directory. Logging in takes about 10
+seconds.
+
+The serial console shows something only if the server's OS (or BIOS
+console redirection) uses the serial port, and the iDRAC's serial over
+LAN is enabled.
+
+It needs OpenSSH's `ssh`: on Linux the `openssh-client` package, on
+Windows the built-in "OpenSSH Client" optional feature. On Linux the
+desktop's terminal is used (COSMIC Terminal, GNOME Console or Terminal,
+Konsole, Xfce Terminal, and others); set another one under **Options →
+Terminal for SSH**, e.g. `kitty` or `xterm -e`. On Windows it opens a
+console window.
+
+From a terminal:
+
+```sh
+idrac6 ssh myserver           # the iDRAC's command line
+idrac6 ssh myserver --serial  # the serial console
+```
+
 ## Settings
 
 Saved iDRACs live in `config.toml`:
@@ -218,8 +253,8 @@ password" to be asked each time instead. The proxy's certificate and
 key are stored in the same directory.
 
 Set `RUST_LOG=debug` for detailed logs, `IDRAC6_CONFIG_DIR` to use
-another settings directory, or `IDRAC6_FFMPEG` to use a specific FFmpeg
-binary.
+another settings directory, `IDRAC6_FFMPEG` to use a specific FFmpeg
+binary, or `IDRAC6_SSH` to use a specific `ssh`.
 
 ## Troubleshooting
 
@@ -262,6 +297,7 @@ src/
   web.rs         iDRAC web login and viewer.jnlp
   health.rs      status, sensors, power and event log from the web API
   proxy.rs       HTTPS -> TLS 1.0 web proxy
+  ssh.rs         SSH and serial console in a terminal
   tls.rs         legacy TLS settings
 ```
 

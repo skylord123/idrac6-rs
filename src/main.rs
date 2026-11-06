@@ -8,6 +8,7 @@ mod health;
 mod kvm;
 mod mount;
 mod proxy;
+mod ssh;
 mod tls;
 mod video;
 mod vmedia;
@@ -28,6 +29,10 @@ USAGE:
     idrac6 mount <name|host> <image> [--read-write]
                                 Attach an .iso (CD/DVD) or .img (disk) as
                                 virtual media until Enter is pressed
+    idrac6 ssh <name|host> [--serial]
+                                SSH to a saved iDRAC's command line, or with
+                                --serial to the server's serial console
+                                (Ctrl+\\ ends it)
     idrac6 proxy <host> [--port <local-port>] [--https-port <port>]
                                 Run only the web UI proxy, without a GUI
     idrac6 --help | --version
@@ -35,12 +40,15 @@ USAGE:
 ENVIRONMENT:
     RUST_LOG=debug              More logging (also: info, trace)
     IDRAC6_FFMPEG=<path>        FFmpeg to use for MP4 videos
+    IDRAC6_SSH=<path>           ssh to use
     IDRAC6_CONFIG_DIR=<dir>     Use a different settings directory
 ";
 
 fn main() {
     // Set OpenSSL up before anything else touches it, without its exit-time
     // cleanup (background threads may still be using TLS when we exit).
+    // Running as ssh's password helper?
+    ssh::askpass_hook();
     openssl::init();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,winit=warn,egui_glow=warn,glutin=warn")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -74,6 +82,16 @@ fn main() {
             (Some(f), out) => export(f.as_ref(), out.map(Into::into)),
             _ => Err(anyhow::anyhow!("usage: idrac6 export <file> [<out.mp4>]")),
         },
+        Some("ssh") => (|| {
+            let serial = args.iter().any(|a| a == "--serial");
+            let wait = args.iter().any(|a| a == "--wait-on-error");
+            let Some(want) = args[1..].iter().find(|a| !a.starts_with("--")) else {
+                anyhow::bail!("usage: idrac6 ssh <name|host> [--serial]");
+            };
+            let inst = find_saved(want)?;
+            let code = ssh::run(&inst, if serial { ssh::Mode::Serial } else { ssh::Mode::Shell }, wait)?;
+            std::process::exit(code)
+        })(),
         Some("mount") => (|| {
             let (Some(want), Some(image)) = (args.get(1), args.get(2)) else {
                 anyhow::bail!("usage: idrac6 mount <name|host> <image> [--read-write]");
@@ -110,13 +128,18 @@ fn export(file: &std::path::Path, out: Option<std::path::PathBuf>) -> anyhow::Re
     Ok(())
 }
 
-/// Look up a saved iDRAC by name or address; it must have a saved password.
-fn find_instance(want: &str) -> anyhow::Result<config::Instance> {
-    let inst = config::Config::load()
+/// Look up a saved iDRAC by name or address.
+fn find_saved(want: &str) -> anyhow::Result<config::Instance> {
+    config::Config::load()
         .instances
         .into_iter()
         .find(|i| i.name.eq_ignore_ascii_case(want) || i.host == want)
-        .ok_or_else(|| anyhow::anyhow!("no saved iDRAC called '{want}'"))?;
+        .ok_or_else(|| anyhow::anyhow!("no saved iDRAC called '{want}'"))
+}
+
+/// Look up a saved iDRAC by name or address; it must have a saved password.
+fn find_instance(want: &str) -> anyhow::Result<config::Instance> {
+    let inst = find_saved(want)?;
     if inst.password.is_empty() {
         anyhow::bail!("'{want}' has no saved password; open it from the manager instead");
     }

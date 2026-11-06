@@ -18,6 +18,7 @@ use crate::config::{Config, Instance};
 use crate::health::Health;
 use crate::kvm::proto::PowerAction;
 use crate::proxy::WebProxy;
+use crate::ssh;
 use crate::web::WebClient;
 
 const THUMB: egui::Vec2 = egui::vec2(168.0, 126.0);
@@ -205,6 +206,9 @@ impl ManagerWindow {
                 ui.label("Console");
                 ui.checkbox(&mut inst.view_only, "Open in view-only mode (no keyboard or mouse)");
                 ui.end_row();
+                ui.label("SSH port");
+                ui.add(egui::DragValue::new(&mut inst.ssh_port).range(1..=65535));
+                ui.end_row();
                 ui.label("Web proxy port");
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut inst.proxy_port).range(0..=65535));
@@ -376,6 +380,13 @@ impl ManagerWindow {
                             }
                         });
                         ui.menu_button("More", |ui| {
+                            if ui.button("SSH command line").on_hover_text("Open the iDRAC's command line (racadm, SM-CLP) in a terminal").clicked() {
+                                action = Some(Action::Ssh(ssh::Mode::Shell));
+                            }
+                            if ui.button("Serial console").on_hover_text("The server's serial port (COM2) over SSH, in a terminal. Ctrl+\\ ends it.").clicked() {
+                                action = Some(Action::Ssh(ssh::Mode::Serial));
+                            }
+                            ui.separator();
                             if ui.button("Blink identify LED (1 minute)").on_hover_text("Find the server in the rack by its blinking blue light").clicked() {
                                 action = Some(Action::Identify(60));
                             }
@@ -495,6 +506,16 @@ impl ManagerWindow {
                 self.apply_live_settings();
                 self.save();
             }
+            if !cfg!(windows) {
+                ui.separator();
+                ui.label("Terminal for SSH");
+                let r = ui
+                    .add(egui::TextEdit::singleline(&mut self.config.settings.terminal).hint_text("automatic").desired_width(180.0))
+                    .on_hover_text("The terminal program and the option that makes it run a command, e.g. \"kitty\" or \"xterm -e\". Leave empty to use the desktop's terminal.");
+                if r.lost_focus() {
+                    self.save();
+                }
+            }
             ui.separator();
             if ui.add_enabled(self.config.settings.live_status, egui::Button::new("Refresh all")).clicked() {
                 for m in self.monitors.iter().flatten() {
@@ -514,6 +535,7 @@ enum Action {
     Captures,
     Power(PowerAction),
     Identify(u8),
+    Ssh(ssh::Mode),
     Refresh,
     Edit,
     Remove,
@@ -707,6 +729,11 @@ impl WindowUi for ManagerWindow {
                 Some((i, Action::Proxy)) => self.toggle_proxy(i),
                 Some((i, Action::Power(a))) => self.confirm_power = Some((i, a)),
                 Some((i, Action::Identify(s))) => self.act_or_prompt(i, Open::Identify(s), shell),
+                Some((i, Action::Ssh(mode))) => {
+                    if let Err(e) = ssh::open_terminal(&self.config.instances[i], mode, &self.config.settings.terminal) {
+                        self.error = Some(format!("Could not open SSH: {e:#}"));
+                    }
+                }
                 Some((i, Action::Refresh)) => {
                     if let Some(m) = self.monitor(i) {
                         m.refresh();
