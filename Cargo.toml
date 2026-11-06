@@ -27,6 +27,7 @@ egui_glow = { version = "0.37", features = ["winit"] }
 glow = "0.17"
 glutin = "0.32"
 glutin-winit = "0.5"
+keyring = { version = "3.6", features = ["apple-native", "crypto-rust", "sync-secret-service", "windows-native"] }
 winit = "0.30"
 env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }

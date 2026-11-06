@@ -35,6 +35,9 @@ ENVIRONMENT:
 ";
 
 fn main() {
+    // Set OpenSSL up before anything else touches it, without its exit-time
+    // cleanup (background threads may still be using TLS when we exit).
+    openssl::init();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,winit=warn,egui_glow=warn,glutin=warn")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.first().map(String::as_str) {

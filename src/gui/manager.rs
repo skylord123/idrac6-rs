@@ -200,7 +200,7 @@ impl ManagerWindow {
                 ui.add(egui::TextEdit::singleline(&mut inst.password).password(true).desired_width(240.0));
                 ui.end_row();
                 ui.label("");
-                ui.checkbox(&mut inst.save_password, "Save password (stored in plain text)");
+                ui.checkbox(&mut inst.save_password, format!("Save password ({})", crate::config::password_storage()));
                 ui.end_row();
                 ui.label("Console");
                 ui.checkbox(&mut inst.view_only, "Open in view-only mode (no keyboard or mouse)");

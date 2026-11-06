@@ -48,8 +48,8 @@ cargo build --release --features vendored-openssl   # builds OpenSSL in (Windows
 ./target/release/idrac6
 ```
 
-On Linux the system OpenSSL build needs `libssl-dev` (Debian/Ubuntu) or
-`openssl-devel` (Fedora). On Windows use `--features vendored-openssl`,
+On Linux the build needs `libssl-dev` and `libdbus-1-dev` (Debian/Ubuntu)
+or `openssl-devel` and `dbus-devel` (Fedora). On Windows use `--features vendored-openssl`,
 which needs Perl and NASM.
 
 To build the Debian package (binary, menu entry and icons):
@@ -194,9 +194,13 @@ Saved iDRACs live in `config.toml`:
 | Linux | `~/.config/idrac6-rs/` |
 | Windows | `%APPDATA%\idrac6-rs\config\` |
 
-Passwords are stored **in plain text** in that file when "Save password"
-is ticked. On Linux the file is only readable by your user. Untick it to
-be asked for the password each time instead. The proxy's certificate and
+When "Save password" is ticked, the password goes into the system
+keyring: GNOME Keyring or KWallet on Linux (through the Secret Service),
+Credential Manager on Windows. Passwords saved in `config.toml` by older
+versions are moved there on the next start. Without a keyring service
+(e.g. a minimal window manager), passwords are stored in plain text in
+`config.toml`, which on Linux only your user can read. Untick "Save
+password" to be asked each time instead. The proxy's certificate and
 key are stored in the same directory.
 
 Set `RUST_LOG=debug` for detailed logs, or `IDRAC6_CONFIG_DIR` to use
