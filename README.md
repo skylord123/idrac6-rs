@@ -276,7 +276,7 @@ On **Unraid**, add the login prompt by appending these lines to
 once to start it right away:
 
 ```sh
-grep -q ttyS1 /etc/inittab || echo 's1:12345:respawn:/sbin/agetty -L 115200 ttyS1 vt100' >> /etc/inittab
+grep -q '^[^#].*agetty.*ttyS1' /etc/inittab || echo 's1:12345:respawn:/sbin/agetty -L 115200 ttyS1 vt100' >> /etc/inittab
 grep -qx ttyS1 /etc/securetty 2>/dev/null || echo ttyS1 >> /etc/securetty
 telinit q
 ```
@@ -285,7 +285,9 @@ For boot messages, add `console=tty0 console=ttyS1,115200n8` to the
 `append` line under *Unraid OS* in Main → Flash → Syslinux Configuration,
 and reboot.
 
-To check which port is COM2, open the serial console and run
+The kernel log shows which port the BIOS redirects to: `dmesg | grep
+SPCR` prints e.g. `console: uart,io,0x2f8,115200`; 0x2f8 is `ttyS1`,
+0x3f8 is `ttyS0`. Or open the serial console and run
 `echo hello > /dev/ttyS1` on the server; if nothing appears, try
 `/dev/ttyS0`.
 
