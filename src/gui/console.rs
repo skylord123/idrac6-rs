@@ -289,7 +289,11 @@ impl ConsoleWindow {
                     }
                 }
             })();
-            let _ = tx.send(r);
+            // The window was closed while logging in: log out again, or
+            // the session stays taken until the iDRAC times it out.
+            if let Err(mpsc::SendError(Ok((web, _)))) = tx.send(r) {
+                let _ = web.logout();
+            }
             notify();
         });
         self.status = format!("Logging in to {}…", self.inst.host);
