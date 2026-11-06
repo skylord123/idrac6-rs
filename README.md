@@ -277,7 +277,6 @@ once to start it right away:
 
 ```sh
 grep -q '^[^#].*agetty.*ttyS1' /etc/inittab || echo 's1:12345:respawn:/sbin/agetty -L 115200 ttyS1 vt100' >> /etc/inittab
-grep -qx ttyS1 /etc/securetty 2>/dev/null || echo ttyS1 >> /etc/securetty
 telinit q
 ```
 
