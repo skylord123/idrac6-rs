@@ -81,6 +81,8 @@ pub struct ConsoleWindow {
     type_text: Option<String>,
     type_speed: Speed,
     typing: Option<TypeJob>,
+    /// Short-lived note in the status bar ("Screenshot copied").
+    toast: Option<(String, Instant)>,
 }
 
 #[derive(Default)]
@@ -156,6 +158,7 @@ impl ConsoleWindow {
             type_text: None,
             type_speed: Speed::Normal,
             typing: None,
+            toast: None,
         }
     }
 
@@ -241,7 +244,7 @@ impl ConsoleWindow {
     }
 
     fn open_type_dialog(&mut self) {
-        let clip = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+        let clip = super::clipboard::text().unwrap_or_default();
         self.type_text = Some(clip);
     }
 
@@ -404,6 +407,22 @@ impl ConsoleWindow {
         }
     }
 
+    fn copy_screenshot(&mut self) {
+        let Some(s) = self.session() else { return };
+        let r = {
+            let fb = s.shared.fb.lock().unwrap();
+            if fb.width == 0 {
+                Err(anyhow::anyhow!("there is no picture yet"))
+            } else {
+                super::clipboard::copy_image(fb.width, fb.height, &fb.pixels)
+            }
+        };
+        match r {
+            Ok(()) => self.toast = Some(("Screenshot copied to the clipboard".into(), Instant::now())),
+            Err(e) => self.message = Some(format!("Could not copy the screenshot: {e:#}")),
+        }
+    }
+
     fn screenshot(&mut self) {
         let Some(s) = self.session() else { return };
         let (w, h, rgb) = {
@@ -428,8 +447,12 @@ impl ConsoleWindow {
     fn menu(&mut self, ui: &mut egui::Ui, window: &Window, shell: &mut Shell) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Save screenshot…").clicked() {
+                let has_picture = self.texture.is_some() && self.session().is_some();
+                if ui.add_enabled(has_picture, egui::Button::new("Save screenshot…")).clicked() {
                     self.screenshot();
+                }
+                if ui.add_enabled(has_picture, egui::Button::new("Copy screenshot")).clicked() {
+                    self.copy_screenshot();
                 }
                 ui.separator();
                 if ui.button("Reconnect").clicked() {
@@ -983,6 +1006,13 @@ impl WindowUi for ConsoleWindow {
                     ui.add(egui::ProgressBar::new(done as f32 / job.total.max(1) as f32).desired_width(140.0).text(format!("Typing {done}/{}", job.total)));
                     if ui.small_button("Stop").clicked() {
                         job.cancel();
+                    }
+                }
+                if let Some((t, at)) = &self.toast {
+                    if at.elapsed() < Duration::from_secs(3) {
+                        ui.separator();
+                        ui.label(t.as_str());
+                        ui.ctx().request_repaint_after(Duration::from_secs(3).saturating_sub(at.elapsed()));
                     }
                 }
                 if self.grabbed {

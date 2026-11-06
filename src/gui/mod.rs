@@ -4,6 +4,7 @@
 //! events (modifiers, Super, PrintScreen, keypad, Ctrl+C, ...) that egui
 //! swallows or does not model.
 
+mod clipboard;
 mod console;
 mod manager;
 mod playback;

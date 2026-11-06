@@ -83,7 +83,8 @@ slow.
   **View → View only** stops all keyboard and mouse input, for watching a
   server without the risk of a stray key press. Tick *Open in view-only
   mode* in an iDRAC's settings to make that the default.
-- **File → Save screenshot** saves a PNG.
+- **File → Save screenshot** saves a PNG; **File → Copy screenshot** puts
+  it on the clipboard.
 - **Tools → Mouse acceleration** should match the server's OS (Windows or
   Linux). A mismatch makes the server's pointer drift away from yours.
 - **Tools → Single cursor** hides your pointer and moves the server's pointer

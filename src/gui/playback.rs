@@ -219,6 +219,11 @@ impl PlaybackWindow {
             if ui.button("Save screenshot…").clicked() {
                 self.screenshot();
             }
+            if ui.button("Copy").on_hover_text("Copy the current picture to the clipboard").clicked() {
+                if let Err(e) = super::clipboard::copy_image(self.fb.width, self.fb.height, &self.fb.pixels) {
+                    self.message = Some(format!("Could not copy the picture: {e:#}"));
+                }
+            }
         });
         let mut secs = self.pos.min(total).as_secs_f32();
         ui.spacing_mut().slider_width = ui.available_width();
