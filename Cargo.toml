@@ -2,6 +2,7 @@
 name = "idrac6"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "Native virtual console (KVM), virtual media and web UI proxy for Dell iDRAC6"
 license = "MIT"
 readme = "README.md"
@@ -15,9 +16,14 @@ default = []
 # Build OpenSSL from source and link it statically. Used for Windows and
 # portable release builds; Linux distro builds can use the system OpenSSL.
 vendored-openssl = ["openssl/vendored"]
+# Windows: build a console program (idrac6-cli.exe) instead of a windowed
+# one, so command-line use prints to the terminal and waits for it.
+console = []
 
 [dependencies]
 anyhow = "1"
+arboard = { version = "3.6", default-features = false, features = ["image-data", "wayland-data-control"] }
+ctrlc = { version = "3.4", features = ["termination"] }
 directories = "6"
 egui = { version = "0.37", features = ["default_fonts"] }
 egui-winit = { version = "0.37", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
@@ -25,6 +31,7 @@ egui_glow = { version = "0.37", features = ["winit"] }
 glow = "0.17"
 glutin = "0.32"
 glutin-winit = "0.5"
+keyring = { version = "3.6", features = ["apple-native", "crypto-rust", "sync-secret-service", "windows-native"] }
 winit = "0.30"
 env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -45,7 +52,8 @@ name = "idrac6"
 section = "net"
 priority = "optional"
 depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libegl1 | libgl1"
-recommends = "xdg-desktop-portal"
+recommends = "xdg-desktop-portal, openssh-client"
+suggests = "ffmpeg"
 extended-description = """\
 Native replacement for the Dell iDRAC6 Java virtual console. Shows the \
 server screen with keyboard and mouse control, power control and \
@@ -65,6 +73,40 @@ assets = [
     ["README.md", "usr/share/doc/idrac6/README.md", "644"],
     ["docs/*.md", "usr/share/doc/idrac6/", "644"],
 ]
+
+# `cargo generate-rpm` (after a release build) builds a Fedora/openSUSE
+# package. Library dependencies are found automatically; the ones below
+# are loaded at runtime and are listed by the capability every RPM
+# distribution provides.
+[package.metadata.generate-rpm]
+name = "idrac6"
+summary = "Native virtual console and virtual media for Dell iDRAC6"
+license = "MIT"
+assets = [
+    { source = "target/release/idrac6", dest = "/usr/bin/idrac6", mode = "755" },
+    { source = "assets/idrac6.desktop", dest = "/usr/share/applications/idrac6.desktop", mode = "644" },
+    { source = "assets/icon-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-24.png", dest = "/usr/share/icons/hicolor/24x24/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/idrac6.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/idrac6/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/idrac6/LICENSE", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+"libxkbcommon.so.0()(64bit)" = "*"
+"libxkbcommon-x11.so.0()(64bit)" = "*"
+"libEGL.so.1()(64bit)" = "*"
+
+[package.metadata.generate-rpm.recommends]
+openssh-clients = "*"
+
+[package.metadata.generate-rpm.suggests]
+ffmpeg = "*"
 
 [profile.release]
 opt-level = 3

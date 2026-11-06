@@ -1,6 +1,9 @@
 //! Video decoding for the iDRAC6 virtual console.
 
 pub mod aspeed;
+pub mod dvc;
+pub mod mp4;
+pub mod playback;
 
 /// Decoded screen contents. Pixels are 0x00RRGGBB, row-major.
 #[derive(Clone, Default)]

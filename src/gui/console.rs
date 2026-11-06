@@ -1,9 +1,10 @@
 //! Virtual console window.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,7 +19,12 @@ use super::{Shell, UserEvent, WindowUi};
 use crate::config::Instance;
 use crate::kvm::keymap::{self, Macro};
 use crate::kvm::proto::{self, Bandwidth, PowerAction, SharingAnswer, buttons};
-use crate::kvm::session::{KvmEvent, KvmSession, VideoState};
+use crate::kvm::session::{KvmEvent, KvmSession, Recorder, VideoState};
+use super::mp4::{Choice, FfmpegDialog};
+use crate::video::mp4::{Export, Ffmpeg};
+use crate::video::playback::Writer;
+use crate::kvm::typer::{self, Speed, TypeJob};
+use crate::ssh;
 use crate::web::{ConsoleInfo, WebSession};
 
 enum Phase {
@@ -36,7 +42,10 @@ pub struct ConsoleWindow {
     window_id: Option<WindowId>,
     proxy: Option<EventLoopProxy<UserEvent>>,
     status: String,
+    /// The iDRAC made this a view-only session.
     view_only: bool,
+    /// The user turned input off (View → View only).
+    user_view_only: bool,
     resolution: Option<(u16, u16)>,
     leds: proto::Leds,
     video_state: Option<VideoState>,
@@ -45,6 +54,17 @@ pub struct ConsoleWindow {
     in_use_retry: bool,
     /// Connect with the "share" flag once the login finishes.
     pending_shared: bool,
+    focused: bool,
+    mouse_accel: Option<u8>,
+    bandwidth: Bandwidth,
+    /// Single cursor mode: hide our pointer and send relative movement.
+    single_cursor: bool,
+    /// The pointer is currently captured for single cursor mode.
+    grabbed: bool,
+    want_grab: Option<bool>,
+    rel: (f64, f64),
+    rel_sent: Instant,
+    show_about: bool,
 
     texture: Option<egui::TextureHandle>,
     shown_seq: u64,
@@ -62,6 +82,91 @@ pub struct ConsoleWindow {
     show_stats: bool,
     stats: Stats,
     vm: VmPanel,
+    /// "Type text" dialog: the text to type.
+    type_text: Option<String>,
+    type_speed: Speed,
+    typing: Option<TypeJob>,
+    /// Short-lived note in the status bar ("Screenshot copied").
+    toast: Option<(String, Instant)>,
+    /// Tools → Reconnect automatically.
+    auto_reconnect: bool,
+    /// An automatic reconnect sequence is under way.
+    retry: Option<Retry>,
+    /// The current session got as far as showing the console.
+    was_running: bool,
+    /// Why the iDRAC said it ended the session, if it did.
+    end_reason: Option<u8>,
+    /// The picture is left over from a previous session.
+    stale: bool,
+    /// Web sessions of earlier connections that still need logging out
+    /// (the logout failed while the iDRAC was unreachable).
+    old_webs: Arc<Mutex<Vec<Arc<WebSession>>>>,
+    /// File → Start recording. Kept across reconnects.
+    recorder: Recorder,
+    /// The current recording becomes this MP4 video when it stops (the
+    /// recorder writes a .dvcrec next to it first).
+    rec_video: Option<(PathBuf, Ffmpeg)>,
+    /// A stopped recording being turned into an MP4 video.
+    saving_video: Option<SavingVideo>,
+    ffmpeg_dialog: Option<FfmpegDialog>,
+    /// Close the window once the video is saved.
+    closing: bool,
+    /// A finished recording to tell the user about.
+    saved_recording: Option<Saved>,
+    /// Open the player for this file on the next frame.
+    play_file: Option<std::path::PathBuf>,
+}
+
+struct SavingVideo {
+    job: Export,
+    /// The .dvcrec it is made from, deleted when the video is done.
+    raw: PathBuf,
+}
+
+#[derive(Clone)]
+struct Saved {
+    path: PathBuf,
+    len: Duration,
+    bytes: u64,
+    video: bool,
+}
+
+struct Notice {
+    title: String,
+    detail: String,
+    /// Secondary line, e.g. why the last attempt failed.
+    note: Option<String>,
+    spinner: bool,
+    error: bool,
+    buttons: Vec<NoticeButton>,
+}
+
+#[derive(Clone, Copy)]
+enum NoticeButton {
+    ReconnectNow,
+    StopRetry,
+    TryAgain,
+    AskShare,
+}
+
+struct Retry {
+    attempt: u32,
+    /// When the next attempt starts; `None` while one is in progress.
+    at: Option<Instant>,
+    /// Why the connection was lost.
+    reason: String,
+    /// Why the latest reconnect attempt failed.
+    last_error: Option<String>,
+}
+
+/// Why a connection attempt or session failed.
+enum Failure {
+    /// Web login or downloading the console tokens.
+    WebLogin,
+    /// The console refused the login.
+    ConsoleLogin,
+    /// An established session ended.
+    Lost,
 }
 
 #[derive(Default)]
@@ -76,6 +181,16 @@ fn macros() -> &'static [Macro] {
     M.get_or_init(keymap::macros)
 }
 
+fn alt_f() -> &'static [Macro] {
+    static M: OnceLock<Vec<Macro>> = OnceLock::new();
+    M.get_or_init(|| keymap::function_key_macros(false))
+}
+
+fn ctrl_alt_f() -> &'static [Macro] {
+    static M: OnceLock<Vec<Macro>> = OnceLock::new();
+    M.get_or_init(|| keymap::function_key_macros(true))
+}
+
 fn sysrq() -> &'static [Macro] {
     static M: OnceLock<Vec<Macro>> = OnceLock::new();
     M.get_or_init(keymap::sysrq_macros)
@@ -85,13 +200,13 @@ impl ConsoleWindow {
     pub fn new(inst: Instance) -> Self {
         Self {
             phase: Phase::Failed(String::new()),
-            inst,
             web: None,
             info: None,
             window_id: None,
             proxy: None,
             status: "Starting…".into(),
             view_only: false,
+            user_view_only: inst.view_only,
             resolution: None,
             leds: Default::default(),
             video_state: None,
@@ -99,6 +214,15 @@ impl ConsoleWindow {
             sharing: None,
             in_use_retry: false,
             pending_shared: false,
+            focused: true,
+            mouse_accel: None,
+            bandwidth: Bandwidth::Unlimited,
+            single_cursor: false,
+            grabbed: false,
+            want_grab: None,
+            rel: (0.0, 0.0),
+            rel_sent: Instant::now(),
+            show_about: false,
             texture: None,
             shown_seq: 0,
             fit: true,
@@ -114,6 +238,24 @@ impl ConsoleWindow {
             show_stats: false,
             stats: Stats::default(),
             vm: VmPanel::new(),
+            inst,
+            type_text: None,
+            type_speed: Speed::Normal,
+            typing: None,
+            toast: None,
+            auto_reconnect: true,
+            retry: None,
+            was_running: false,
+            end_reason: None,
+            stale: false,
+            old_webs: Arc::default(),
+            recorder: Recorder::default(),
+            rec_video: None,
+            saving_video: None,
+            ffmpeg_dialog: None,
+            closing: false,
+            saved_recording: None,
+            play_file: None,
         }
     }
 
@@ -142,12 +284,16 @@ impl ConsoleWindow {
                 match web.console_info() {
                     Ok(info) => Ok((web, info)),
                     Err(e) => {
-                        web.logout();
+                        let _ = web.logout();
                         Err(e)
                     }
                 }
             })();
-            let _ = tx.send(r);
+            // The window was closed while logging in: log out again, or
+            // the session stays taken until the iDRAC times it out.
+            if let Err(mpsc::SendError(Ok((web, _)))) = tx.send(r) {
+                let _ = web.logout();
+            }
             notify();
         });
         self.status = format!("Logging in to {}…", self.inst.host);
@@ -157,7 +303,7 @@ impl ConsoleWindow {
     fn connect(&mut self, shared: bool) {
         let Some(info) = &self.info else { return };
         let params = info.kvm_params(&self.inst.host, shared);
-        let session = KvmSession::start(params, self.notifier());
+        let session = KvmSession::start_with_recorder(params, self.notifier(), self.recorder.clone());
         self.phase = Phase::Connected(session);
     }
 
@@ -169,7 +315,24 @@ impl ConsoleWindow {
     }
 
     fn can_input(&self) -> bool {
-        self.session().is_some() && !self.view_only
+        self.session().is_some() && !self.view_only && !self.user_view_only
+    }
+
+    fn set_user_view_only(&mut self, on: bool) {
+        if on {
+            self.release_all_keys();
+            if let Some(job) = self.typing.take() {
+                job.cancel();
+            }
+            self.want_grab = Some(false);
+            if self.mouse_buttons != 0 {
+                self.mouse_buttons = 0;
+                if let (Some(s), Some((x, y))) = (self.session(), self.mouse) {
+                    s.mouse(x, y, 0, 0);
+                }
+            }
+        }
+        self.user_view_only = on;
     }
 
     fn release_all_keys(&mut self) {
@@ -178,6 +341,67 @@ impl ConsoleWindow {
             for k in keys {
                 s.key(k, false);
             }
+        }
+    }
+
+    fn open_type_dialog(&mut self) {
+        let clip = super::clipboard::text().unwrap_or_default();
+        self.type_text = Some(clip);
+    }
+
+    fn start_typing(&mut self, text: &str) {
+        self.release_all_keys();
+        let Some(s) = self.session() else { return };
+        let job = TypeJob::start(s.sender(), text, self.type_speed, self.notifier());
+        self.typing = Some(job);
+    }
+
+    fn type_dialog(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.type_text.as_mut() else { return };
+        let mut go = false;
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique("type-text")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Type text");
+            ui.label("The text is typed on the server as keystrokes. Paste with Ctrl+V or edit it below.");
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                ui.add(egui::TextEdit::multiline(text).font(egui::TextStyle::Monospace).desired_rows(8).desired_width(f32::INFINITY).hint_text("Text to type"));
+            });
+            let chars = typer::normalize(text).chars().filter(|&c| typer::stroke(c).is_some()).count();
+            let lines = text.lines().count().max(1);
+            ui.weak(format!("{chars} character{}, {lines} line{}", plural(chars), plural(lines)));
+            let bad = typer::untypeable(text);
+            if !bad.is_empty() {
+                let list: String = bad.iter().take(12).map(|c| if c.is_control() { format!("U+{:04X} ", *c as u32) } else { format!("{c} ") }).collect();
+                ui.colored_label(ui.visuals().warn_fg_color, format!("Skipped (no key on a US keyboard): {}", list.trim_end()));
+            }
+            if self.leds.caps {
+                ui.colored_label(ui.visuals().warn_fg_color, "Caps Lock is on at the server, so letters may come out in the wrong case.");
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Speed");
+                for sp in Speed::ALL {
+                    ui.radio_value(&mut self.type_speed, sp, sp.label());
+                }
+            });
+            ui.weak("Typed as on a US keyboard; the server's layout decides what appears.");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(chars > 0, egui::Button::new("Type")).clicked() {
+                    go = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if go {
+            let t = self.type_text.take().unwrap_or_default();
+            self.start_typing(&t);
+        } else if close {
+            self.type_text = None;
         }
     }
 
@@ -191,16 +415,27 @@ impl ConsoleWindow {
         if let Phase::LoggingIn(rx) = &self.phase {
             match rx.try_recv() {
                 Ok(Ok((web, info))) => {
+                    // The iDRAC is reachable again: end the sessions whose
+                    // logout failed earlier.
+                    let old = std::mem::take(&mut *self.old_webs.lock().unwrap());
+                    if !old.is_empty() {
+                        let back = self.old_webs.clone();
+                        thread::spawn(move || {
+                            for w in old {
+                                if !w.logout() {
+                                    back.lock().unwrap().push(w);
+                                }
+                            }
+                        });
+                    }
                     self.web = Some(Arc::new(web));
                     self.info = Some(info);
                     self.status = "Connecting to the virtual console…".into();
                     self.connect(self.pending_shared);
                 }
-                Ok(Err(e)) => {
-                    self.phase = Phase::Failed(format!("{e:#}"));
-                }
+                Ok(Err(e)) => self.failed(format!("{e:#}"), Failure::WebLogin),
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.phase = Phase::Failed("login thread died".into()),
+                Err(mpsc::TryRecvError::Disconnected) => self.failed("login thread died".into(), Failure::WebLogin),
             }
         }
         let mut events = Vec::new();
@@ -212,17 +447,30 @@ impl ConsoleWindow {
         for e in events {
             match e {
                 KvmEvent::Status(s) => self.status = s,
-                KvmEvent::Running => self.status = "Connected".into(),
+                KvmEvent::Running => {
+                    self.status = "Connected".into();
+                    self.was_running = true;
+                    self.retry = None;
+                    self.end_reason = None;
+                    if let Phase::Connected(s) = &self.phase {
+                        s.set_focus(self.focused);
+                    }
+                }
                 KvmEvent::LoginFailed(r) => {
                     self.in_use_retry = r.contains("already in use");
-                    self.phase = Phase::Failed(r);
+                    self.failed(r, Failure::ConsoleLogin);
                 }
+                KvmEvent::DisconnectReason(c) => self.end_reason = Some(c),
                 KvmEvent::ViewOnly => self.view_only = true,
                 KvmEvent::Resolution(w, h) => self.resolution = Some((w, h)),
                 KvmEvent::Leds(l) => self.leds = l,
                 KvmEvent::PowerState(p) => self.power = Some(p),
                 KvmEvent::SharingRequest(r) => self.sharing = Some(r),
                 KvmEvent::VideoState(v) => self.video_state = Some(v),
+                KvmEvent::MouseAccel(v) => {
+                    log::info!("iDRAC mouse acceleration: {:?}", proto::MouseAccel::from_u8(v));
+                    self.mouse_accel = Some(v);
+                }
                 KvmEvent::VmCredentials { user, password } => {
                     let port = self.info.as_ref().map(|i| i.kvm_params(&self.inst.host, false).kmport).unwrap_or(5900);
                     let notify = self.notifier();
@@ -230,10 +478,61 @@ impl ConsoleWindow {
                 }
                 KvmEvent::Disconnected(m) => {
                     if !matches!(self.phase, Phase::Failed(_)) {
-                        self.phase = Phase::Failed(m);
+                        self.failed(m, Failure::Lost);
                     }
                 }
             }
+        }
+    }
+
+    /// Record a failure and decide whether to reconnect automatically.
+    fn failed(&mut self, msg: String, kind: Failure) {
+        if let Phase::Connected(s) = &self.phase {
+            s.close();
+        }
+        let retrying = self.retry.is_some();
+        let again = self.auto_reconnect
+            && !self.closing
+            && match kind {
+                // The connection dropped (network, iDRAC reboot, idle
+                // timeout). Not when someone ended it on purpose: an admin,
+                // a local user taking over, or the primary user going
+                // exclusive.
+                Failure::Lost => (self.was_running || retrying) && !matches!(self.end_reason, Some(1 | 3 | 6)),
+                // While the iDRAC reboots, logging in fails for a while.
+                // Wrong credentials will not fix themselves, though, and
+                // retrying them could lock the address out.
+                Failure::WebLogin => retrying && !msg.contains("wrong username or password") && !msg.contains("not allowed to log in"),
+                Failure::ConsoleLogin => false,
+            };
+        if again {
+            let attempt = self.retry.as_ref().map_or(0, |r| r.attempt) + 1;
+            let delay = [2, 5, 10, 20, 30][(attempt as usize - 1).min(4)];
+            let (reason, last_error) = match self.retry.take() {
+                Some(r) => (r.reason, Some(msg.clone())),
+                None => (msg.clone(), None),
+            };
+            log::info!("connection lost ({msg}); reconnecting in {delay} s (attempt {attempt})");
+            self.retry = Some(Retry { attempt, at: Some(Instant::now() + Duration::from_secs(delay)), reason, last_error });
+        } else {
+            self.retry = None;
+        }
+        self.was_running = false;
+        self.phase = Phase::Failed(msg);
+    }
+
+    /// Start the next automatic reconnect attempt when it is due.
+    fn drive_retry(&mut self, ctx: &egui::Context) {
+        let Some(at) = self.retry.as_ref().and_then(|r| r.at) else { return };
+        let now = Instant::now();
+        if now >= at {
+            if let Some(r) = self.retry.as_mut() {
+                r.at = None;
+            }
+            self.start_reconnect(false);
+        } else {
+            // Once a second for the countdown.
+            ctx.request_repaint_after((at - now).min(Duration::from_secs(1)));
         }
     }
 
@@ -252,6 +551,7 @@ impl ConsoleWindow {
         let img = egui::ColorImage::new([fb.width, fb.height], px);
         drop(fb);
         self.shown_seq = seq;
+        self.stale = false;
         match &mut self.texture {
             Some(t) => t.set(img, egui::TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("console", img, egui::TextureOptions::LINEAR)),
@@ -275,6 +575,116 @@ impl ConsoleWindow {
         }
     }
 
+    fn copy_screenshot(&mut self) {
+        let Some(s) = self.session() else { return };
+        let r = {
+            let fb = s.shared.fb.lock().unwrap();
+            if fb.width == 0 {
+                Err(anyhow::anyhow!("there is no picture yet"))
+            } else {
+                super::clipboard::copy_image(fb.width, fb.height, &fb.pixels)
+            }
+        };
+        match r {
+            Ok(()) => self.toast = Some(("Screenshot copied to the clipboard".into(), Instant::now())),
+            Err(e) => self.message = Some(format!("Could not copy the screenshot: {e:#}")),
+        }
+    }
+
+    fn recording(&self) -> Option<Duration> {
+        self.recorder.lock().unwrap().as_ref().map(Writer::elapsed)
+    }
+
+    /// File → Record video (MP4) / Record raw (.dvcrec).
+    fn start_recording(&mut self, video: bool) {
+        let ff = if video {
+            match super::mp4::require() {
+                Ok(ff) => Some(ff),
+                Err(d) => {
+                    self.ffmpeg_dialog = Some(
+                        d.note("You can record as a .dvcrec file now instead, and export it to MP4 later from the player.")
+                            .alternative("Record .dvcrec instead"),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let stem = format!("{}-{}", file_safe(self.inst.title()), timestamp());
+        let dialog = match &ff {
+            Some(_) => rfd::FileDialog::new().set_file_name(format!("{stem}.mp4")).add_filter("MP4 video", &["mp4"]),
+            None => rfd::FileDialog::new().set_file_name(format!("{stem}.dvcrec")).add_filter("Console recording", &["dvcrec"]),
+        };
+        let Some(path) = dialog.save_file() else { return };
+        // A video is recorded as .dvcrec next to it, then converted.
+        let (raw, target) = match ff {
+            Some(ff) => {
+                let target = super::mp4::with_mp4_extension(path);
+                (unused_path(&target.with_extension("dvcrec")), Some((target, ff)))
+            }
+            None => (path, None),
+        };
+        match Writer::create(&raw) {
+            Ok(w) => {
+                *self.recorder.lock().unwrap() = Some(w);
+                self.rec_video = target;
+            }
+            Err(e) => self.message = Some(format!("Could not start recording: {e:#}")),
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let Some(w) = self.recorder.lock().unwrap().take() else { return };
+        let video = self.rec_video.take();
+        let (raw, len, bytes) = match w.finish() {
+            Ok(r) => r,
+            Err(e) => {
+                self.message = Some(format!("The recording could not be saved completely: {e:#}"));
+                return;
+            }
+        };
+        match video {
+            Some((target, ff)) => {
+                let src = raw.clone();
+                let load = move || {
+                    let data = std::fs::read(&src).map_err(|e| anyhow::anyhow!("could not read {}: {e}", src.display()))?;
+                    crate::video::playback::parse(&data)
+                };
+                self.saving_video = Some(SavingVideo { job: Export::start(ff, load, target, self.notifier()), raw });
+            }
+            None => self.saved_recording = Some(Saved { path: raw, len, bytes, video: false }),
+        }
+    }
+
+    /// Check on the MP4 being made from a stopped recording.
+    fn poll_saving_video(&mut self) {
+        let Some(sv) = self.saving_video.as_mut() else { return };
+        let Some(r) = sv.job.poll().cloned() else { return };
+        let cancelled = sv.job.was_cancelled();
+        let sv = self.saving_video.take().expect("saving");
+        match r {
+            Ok(done) => {
+                let _ = std::fs::remove_file(&sv.raw);
+                if !self.closing {
+                    self.saved_recording = Some(Saved { path: done.path, len: done.duration, bytes: done.bytes, video: true });
+                }
+            }
+            Err(_) if cancelled => {
+                self.message = Some(format!(
+                    "Making the video was cancelled. The recording was kept as {}; open it with Open recording to export it again.",
+                    sv.raw.display()
+                ));
+            }
+            Err(e) => {
+                self.message = Some(format!(
+                    "Could not make the MP4 video: {e}\n\nThe recording was kept as {}; open it with Open recording to try again.",
+                    sv.raw.display()
+                ));
+            }
+        }
+    }
+
     fn screenshot(&mut self) {
         let Some(s) = self.session() else { return };
         let (w, h, rgb) = {
@@ -286,7 +696,7 @@ impl ConsoleWindow {
             self.message = Some("There is no picture to save yet.".into());
             return;
         }
-        let name = format!("{}-{}.png", self.inst.title().replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"), timestamp());
+        let name = format!("{}-{}.png", file_safe(self.inst.title()), timestamp());
         let Some(path) = rfd::FileDialog::new().set_file_name(&name).add_filter("PNG image", &["png"]).save_file() else { return };
         let r = image::RgbImage::from_raw(w, h, rgb).map(|img| img.save(&path));
         self.message = Some(match r {
@@ -299,8 +709,37 @@ impl ConsoleWindow {
     fn menu(&mut self, ui: &mut egui::Ui, window: &Window, shell: &mut Shell) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Save screenshot…").clicked() {
+                let has_picture = self.texture.is_some() && self.session().is_some();
+                if ui.add_enabled(has_picture, egui::Button::new("Save screenshot…")).clicked() {
                     self.screenshot();
+                }
+                if ui.add_enabled(has_picture, egui::Button::new("Copy screenshot")).clicked() {
+                    self.copy_screenshot();
+                }
+                ui.separator();
+                if self.recording().is_some() {
+                    if ui.button("Stop recording").clicked() {
+                        self.stop_recording();
+                    }
+                } else {
+                    let can = self.session().is_some() && self.saving_video.is_none();
+                    if ui
+                        .add_enabled(can, egui::Button::new("Record video (MP4)…"))
+                        .on_hover_text("Record the screen as an MP4 video that plays anywhere. Needs FFmpeg.")
+                        .on_disabled_hover_text("Wait until the last video is saved")
+                        .clicked()
+                    {
+                        self.start_recording(true);
+                    }
+                    if ui
+                        .add_enabled(can, egui::Button::new("Record raw (.dvcrec)…"))
+                        .on_hover_text(
+                            "Record the iDRAC's own screen data: small files that play in idrac6 (Open recording) and can be exported to MP4 later.",
+                        )
+                        .clicked()
+                    {
+                        self.start_recording(false);
+                    }
                 }
                 ui.separator();
                 if ui.button("Reconnect").clicked() {
@@ -311,6 +750,21 @@ impl ConsoleWindow {
                 }
             });
             ui.menu_button("View", |ui| {
+                if ui.add_enabled(self.session().is_some(), egui::Button::new("Refresh")).clicked() {
+                    if let Some(s) = self.session() {
+                        s.refresh();
+                    }
+                }
+                ui.separator();
+                let mut vo = self.user_view_only;
+                if ui
+                    .checkbox(&mut vo, "View only")
+                    .on_hover_text("Watch without sending any keyboard or mouse input to the server")
+                    .clicked()
+                {
+                    self.set_user_view_only(vo);
+                }
+                ui.separator();
                 ui.radio_value(&mut self.fit, true, "Fit to window");
                 ui.radio_value(&mut self.fit, false, "Actual size (1:1)");
                 ui.separator();
@@ -322,11 +776,13 @@ impl ConsoleWindow {
                         let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w as u32, h as u32 + 60));
                     }
                 }
-                ui.separator();
-                ui.checkbox(&mut self.show_stats, "Statistics");
             });
             ui.add_enabled_ui(self.can_input(), |ui| {
                 ui.menu_button("Keyboard", |ui| {
+                    if ui.button("Type text…").on_hover_text("Type text (e.g. from the clipboard) as keystrokes").clicked() {
+                        self.open_type_dialog();
+                    }
+                    ui.separator();
                     ui.checkbox(&mut self.capture_keys, "Send keystrokes to server")
                         .on_hover_text("When off, keys go to this window instead (useful to type in menus).");
                     if ui.button("Release all keys").on_hover_text("Fixes keys that appear stuck").clicked() {
@@ -338,6 +794,16 @@ impl ConsoleWindow {
                             if ui.button(m.label).clicked() {
                                 self.send_macro(m);
                             }
+                        }
+                        ui.separator();
+                        for (label, list) in [("Alt-F?", alt_f()), ("Ctrl-Alt-F?", ctrl_alt_f())] {
+                            ui.menu_button(label, |ui| {
+                                for m in list {
+                                    if ui.button(m.label).clicked() {
+                                        self.send_macro(m);
+                                    }
+                                }
+                            });
                         }
                     });
                     ui.menu_button("Linux SysRq", |ui| {
@@ -372,87 +838,289 @@ impl ConsoleWindow {
             if ui.add_enabled(vm_ok, egui::Button::new("Virtual Media")).on_disabled_hover_text("Needs a connected console and the Virtual Media privilege").clicked() {
                 self.vm.open = true;
             }
-            ui.add_enabled_ui(self.session().is_some(), |ui| {
-                ui.menu_button("Video", |ui| {
-                    if ui.button("Refresh screen").clicked() {
-                        if let Some(s) = self.session() {
-                            s.refresh();
-                        }
+            let connected = self.session().is_some();
+            ui.menu_button("Tools", |ui| {
+                ui.add_enabled_ui(connected, |ui| {
+                    if ui
+                        .checkbox(&mut self.single_cursor, "Single cursor")
+                        .on_hover_text("Hide the local pointer and move the server's pointer directly. Click the screen to start, press F9 to release.")
+                        .clicked()
+                        && !self.single_cursor
+                    {
+                        self.want_grab = Some(false);
                     }
-                    ui.menu_button("Bandwidth limit", |ui| {
-                        for b in Bandwidth::ALL {
-                            if ui.button(b.label()).clicked() {
+                    ui.menu_button("Mouse acceleration", |ui| {
+                        ui.weak("Match the server's operating system");
+                        for a in proto::MouseAccel::ALL {
+                            let selected = self.mouse_accel == Some(a as u8);
+                            if ui.radio(selected, a.label()).clicked() {
                                 if let Some(s) = self.session() {
-                                    s.send(proto::set_bandwidth(b as u8));
+                                    s.send(proto::mouse_accel(a as u8));
                                 }
+                                self.mouse_accel = Some(a as u8);
                             }
                         }
                     });
+                    ui.menu_button("Bandwidth limit", |ui| {
+                        for b in Bandwidth::ALL {
+                            if ui.radio(self.bandwidth == b, b.label()).clicked() {
+                                if let Some(s) = self.session() {
+                                    s.send(proto::set_bandwidth(b as u8));
+                                }
+                                self.bandwidth = b;
+                            }
+                        }
+                    });
+                    ui.checkbox(&mut self.auto_reconnect, "Reconnect automatically")
+                        .on_hover_text("Reconnect when the connection drops, e.g. while the iDRAC reboots");
+                    ui.separator();
+                    ui.checkbox(&mut self.show_stats, "Statistics");
                 });
+                ui.separator();
+                for (label, mode, tip) in [
+                    ("SSH command line", ssh::Mode::Shell, "Open the iDRAC's command line (racadm, SM-CLP) in a terminal"),
+                    ("Serial console", ssh::Mode::Serial, "The server's serial port (COM2) over SSH, in a terminal. Ctrl+\\ ends it."),
+                ] {
+                    if ui.button(label).on_hover_text(tip).clicked() {
+                        let terminal = crate::config::Config::load().settings.terminal;
+                        if let Err(e) = ssh::open_terminal(&self.inst, mode, &terminal) {
+                            self.message = Some(format!("Could not open SSH: {e:#}"));
+                        }
+                    }
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                if ui.button("About").clicked() {
+                    self.show_about = true;
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 led(ui, "Scroll", self.leds.scroll);
                 led(ui, "Caps", self.leds.caps);
                 led(ui, "Num", self.leds.num);
                 if self.view_only {
-                    ui.colored_label(ui.visuals().warn_fg_color, "View only");
+                    ui.colored_label(ui.visuals().warn_fg_color, "View only (set by the iDRAC)");
+                } else if self.user_view_only {
+                    let r = ui
+                        .add(egui::Button::new(egui::RichText::new("View only").color(ui.visuals().warn_fg_color)).small())
+                        .on_hover_text("Keyboard and mouse input is off. Click to turn it back on.");
+                    if r.clicked() {
+                        self.set_user_view_only(false);
+                    }
+                }
+                if self.saving_video.is_some() && !self.closing {
+                    ui.separator();
+                    let cancel = self.saving_video.as_ref().is_some_and(|sv| super::mp4::progress_line(ui, "Saving video", &sv.job));
+                    if cancel {
+                        if let Some(sv) = self.saving_video.as_mut() {
+                            sv.job.cancel();
+                        }
+                    }
+                }
+                if let Some(t) = self.recording() {
+                    ui.separator();
+                    let s = t.as_secs();
+                    let red = egui::Color32::from_rgb(230, 70, 70);
+                    let r = ui
+                        .add(egui::Button::new(egui::RichText::new(format!("REC {}:{:02}", s / 60, s % 60)).color(red)).small())
+                        .on_hover_text(if self.rec_video.is_some() {
+                            "Recording an MP4 video. Click to stop."
+                        } else {
+                            "Recording the screen. Click to stop."
+                        });
+                    ui.painter().circle_filled(egui::pos2(r.rect.left() - 8.0, r.rect.center().y), 4.0, red);
+                    ui.add_space(14.0);
+                    if r.clicked() {
+                        self.stop_recording();
+                    }
+                    ui.ctx().request_repaint_after(Duration::from_millis(1000 - (t.as_millis() % 1000) as u64));
                 }
             });
         });
     }
 
+    /// Reconnect now (user request). Ends any automatic reconnect sequence.
     fn reconnect(&mut self, shared: bool) {
+        self.retry = None;
+        self.start_reconnect(shared);
+    }
+
+    fn start_reconnect(&mut self, shared: bool) {
         if let Phase::Connected(s) = &self.phase {
             s.close();
         }
-        self.texture = None;
+        // Keep showing the last picture until the new session sends one.
+        self.stale = self.texture.is_some();
         self.shown_seq = 0;
+        self.was_running = false;
+        self.end_reason = None;
+        self.video_state = None;
+        self.want_grab = Some(false);
         self.view_only = false;
         self.pressed.clear();
         // Session tokens are single use, so always fetch fresh ones.
         if let Some(w) = self.web.take() {
-            thread::spawn(move || w.logout());
+            let old = self.old_webs.clone();
+            thread::spawn(move || {
+                if !w.logout() {
+                    old.lock().unwrap().push(w);
+                }
+            });
         }
         self.pending_shared = shared;
         self.start_login();
     }
 
-    fn video(&mut self, ui: &mut egui::Ui) {
-        let avail = ui.available_size();
-        let Some(tex) = &self.texture else {
-            let failed = match &self.phase {
-                Phase::Failed(m) if !m.is_empty() => Some(m.clone()),
-                _ => None,
-            };
-            ui.centered_and_justified(|ui| {
-                match failed {
-                    Some(m) => {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(avail.y / 3.0);
-                            ui.colored_label(ui.visuals().error_fg_color, m);
-                            ui.add_space(8.0);
-                            if ui.button("Try again").clicked() {
-                                self.reconnect(false);
-                            }
-                            if self.in_use_retry && ui.button("Ask the current user to share").clicked() {
-                                self.reconnect(true);
-                            }
-                        });
-                    }
-                    None => {
-                        let text = match self.video_state {
-                            Some(VideoState::NoSignal) => "No video signal from the server".to_string(),
-                            Some(VideoState::OutOfRange) => "Video mode out of range".to_string(),
-                            _ => self.status.clone(),
-                        };
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(avail.y / 3.0);
-                            ui.spinner();
-                            ui.label(text);
-                        });
+    /// What to tell the user about the connection, if anything.
+    fn connection_notice(&self) -> Option<Notice> {
+        if let Some(r) = &self.retry {
+            return Some(match r.at {
+                Some(at) => {
+                    let secs = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u64;
+                    let attempt = if r.attempt > 1 { format!(" (attempt {})", r.attempt) } else { String::new() };
+                    Notice {
+                        title: "Connection lost".into(),
+                        detail: format!("{}\nReconnecting in {secs} s{attempt}…", r.reason),
+                        note: r.last_error.as_ref().map(|e| format!("Last attempt: {e}")),
+                        spinner: false,
+                        error: false,
+                        buttons: vec![NoticeButton::ReconnectNow, NoticeButton::StopRetry],
                     }
                 }
+                None => Notice {
+                    title: "Reconnecting…".into(),
+                    detail: self.status.clone(),
+                    note: None,
+                    spinner: true,
+                    error: false,
+                    buttons: vec![NoticeButton::StopRetry],
+                },
             });
+        }
+        if let Phase::Failed(m) = &self.phase {
+            if m.is_empty() {
+                return None;
+            }
+            let mut buttons = vec![NoticeButton::TryAgain];
+            if self.in_use_retry {
+                buttons.push(NoticeButton::AskShare);
+            }
+            return Some(Notice { title: "Disconnected".into(), detail: m.clone(), note: None, spinner: false, error: true, buttons });
+        }
+        if self.stale {
+            return Some(Notice { title: "Reconnecting…".into(), detail: self.status.clone(), note: None, spinner: true, error: false, buttons: vec![] });
+        }
+        None
+    }
+
+    /// A centred box with the notice, on top of the screen area.
+    fn notice_panel(&mut self, ui: &egui::Ui, rect: egui::Rect, n: Notice) {
+        let mut clicked = None;
+        egui::Area::new(egui::Id::unique("connection-notice"))
+            .order(egui::Order::Middle)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .fixed_pos(rect.center())
+            .constrain_to(rect)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(16.0).show(ui, |ui| {
+                    ui.set_min_width(340.0);
+                    ui.set_max_width(460.0);
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            if n.spinner {
+                                ui.spinner();
+                            }
+                            ui.heading(&n.title);
+                        });
+                        if !n.detail.is_empty() {
+                            ui.add_space(4.0);
+                            let text = egui::RichText::new(&n.detail);
+                            ui.label(if n.error { text.color(ui.visuals().error_fg_color) } else { text });
+                        }
+                        if let Some(e) = &n.note {
+                            ui.add_space(2.0);
+                            ui.weak(e);
+                        }
+                        if !n.buttons.is_empty() {
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                for b in &n.buttons {
+                                    let label = match b {
+                                        NoticeButton::ReconnectNow => "Reconnect now",
+                                        NoticeButton::StopRetry => "Stop",
+                                        NoticeButton::TryAgain => "Reconnect",
+                                        NoticeButton::AskShare => "Ask the current user to share",
+                                    };
+                                    if ui.button(label).clicked() {
+                                        clicked = Some(*b);
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+            });
+        match clicked {
+            Some(NoticeButton::ReconnectNow | NoticeButton::TryAgain) => self.reconnect(false),
+            Some(NoticeButton::AskShare) => self.reconnect(true),
+            Some(NoticeButton::StopRetry) => {
+                self.retry = None;
+                if !matches!(self.phase, Phase::Failed(_)) {
+                    // Let the attempt that is under way finish on its own.
+                    self.stale = false;
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn video(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_size();
+        let notice = self.connection_notice();
+        let Some(tex) = &self.texture else {
+            if let Some(n) = notice {
+                self.notice_panel(ui, ui.max_rect(), n);
+                return;
+            }
+            // No picture yet (connecting, no signal, out of range, screen
+            // asleep). The area still takes keyboard and mouse input, so a
+            // key press or click can wake the server's screen.
+            let resp = ui.allocate_rect(ui.max_rect(), egui::Sense::click_and_drag());
+            self.hovering_video = resp.hovered() || resp.dragged();
+            if self.can_input() {
+                let (w, h) = self.resolution.map(|(w, h)| (w as f32, h as f32)).unwrap_or((1024.0, 768.0));
+                self.pointer_input(ui, &resp, w, h);
+            }
+            let wake = "Press a key or click here to wake the server's screen.";
+            let (text, spinner) = match self.video_state {
+                Some(VideoState::NoSignal) => (format!("No video signal from the server.\n{wake}"), false),
+                Some(VideoState::OutOfRange) => (
+                    format!("The iDRAC reports the video mode is out of range.\n{wake}\nIf it stays like this, lower the server's resolution (iDRAC6 supports up to 1280×1024 at 60 Hz)."),
+                    false,
+                ),
+                Some(VideoState::Calibrating) => ("The iDRAC is calibrating the video signal…".to_string(), true),
+                Some(VideoState::Stopped(c)) => (format!("Video is blocked or stopped by the iDRAC (code {c})."), false),
+                _ => (self.status.clone(), true),
+            };
+            // Painted rather than added as widgets: a label would take the
+            // pointer, and clicks and keys over the text would not reach
+            // the server.
+            let rect = resp.rect;
+            let mut y = rect.top() + rect.height() / 3.0;
+            if spinner {
+                let size = ui.style().spacing.interact_size.y;
+                egui::Spinner::new().paint_at(ui, egui::Rect::from_center_size(egui::pos2(rect.center().x, y + size / 2.0), egui::vec2(size, size)));
+                y += size + ui.style().spacing.item_spacing.y;
+            }
+            let mut job = egui::text::LayoutJob::simple(
+                text,
+                egui::TextStyle::Body.resolve(ui.style()),
+                egui::Color32::from_gray(200),
+                (rect.width() - 32.0).max(100.0),
+            );
+            job.halign = egui::Align::Center;
+            let galley = ui.painter().layout_job(job);
+            ui.painter().galley(egui::pos2(rect.center().x, y), galley, egui::Color32::from_gray(200));
             return;
         };
         let [tw, th] = tex.size();
@@ -466,18 +1134,121 @@ impl ConsoleWindow {
         };
         let sized = egui::load::SizedTexture::new(tex.id(), size);
         let image = egui::Image::new(sized).sense(egui::Sense::click_and_drag());
+        let full = ui.max_rect();
         let resp = if self.fit {
             ui.centered_and_justified(|ui| ui.add(image)).inner
         } else {
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| ui.add(image)).inner
         };
         self.hovering_video = resp.hovered() || resp.dragged();
-        if self.can_input() {
-            self.mouse_input(ui, &resp, tw, th);
+        if let Some(n) = notice {
+            // Dim the last picture while there is no live session.
+            ui.painter().rect_filled(resp.rect.intersect(full), 0.0, egui::Color32::from_black_alpha(160));
+            self.notice_panel(ui, full, n);
+            return;
         }
-        if let (Some(VideoState::NoSignal | VideoState::OutOfRange), Some(_)) = (self.video_state, &self.texture) {
+        if self.can_input() {
+            self.pointer_input(ui, &resp, tw, th);
+        }
+        if let Some(VideoState::NoSignal | VideoState::OutOfRange) = self.video_state {
             let text = if self.video_state == Some(VideoState::NoSignal) { "No signal" } else { "Out of range" };
             ui.painter().text(resp.rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(24.0), egui::Color32::YELLOW);
+        }
+    }
+
+    /// Route pointer input to absolute or single cursor (relative) mode.
+    fn pointer_input(&mut self, ui: &egui::Ui, resp: &egui::Response, tw: f32, th: f32) {
+        if self.grabbed {
+            self.relative_buttons(ui);
+        } else if self.single_cursor && resp.clicked() {
+            self.want_grab = Some(true);
+        } else {
+            self.mouse_input(ui, resp, tw, th);
+        }
+    }
+
+    /// Buttons and wheel while the pointer is captured.
+    fn relative_buttons(&mut self, ui: &egui::Ui) {
+        let (primary, secondary, middle, scroll) = ui.input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.secondary_down(),
+                i.pointer.middle_down(),
+                i.raw.events.iter().fold(0.0f32, |acc, e| match e {
+                    egui::Event::MouseWheel { unit, delta, .. } => {
+                        acc + delta.y
+                            * match unit {
+                                egui::MouseWheelUnit::Point => 1.0,
+                                egui::MouseWheelUnit::Line => 40.0,
+                                egui::MouseWheelUnit::Page => 120.0,
+                            }
+                    }
+                    _ => acc,
+                }),
+            )
+        });
+        let mut b = 0;
+        if primary {
+            b |= buttons::LEFT;
+        }
+        if secondary {
+            b |= buttons::RIGHT;
+        }
+        if middle {
+            b |= buttons::MIDDLE;
+        }
+        self.wheel_acc += scroll;
+        let mut wheel = 0i16;
+        while self.wheel_acc >= 40.0 {
+            wheel += 1;
+            self.wheel_acc -= 40.0;
+        }
+        while self.wheel_acc <= -40.0 {
+            wheel -= 1;
+            self.wheel_acc += 40.0;
+        }
+        if b != self.mouse_buttons || wheel != 0 {
+            self.mouse_buttons = b;
+            self.flush_relative(true, wheel);
+        }
+    }
+
+    /// Send accumulated relative motion. Rate-limited to 100 messages/s
+    /// unless `force` (button or wheel change).
+    fn flush_relative(&mut self, force: bool, wheel: i16) {
+        let (dx, dy) = (self.rel.0.trunc(), self.rel.1.trunc());
+        let moved = dx != 0.0 || dy != 0.0;
+        if !force && (!moved || self.rel_sent.elapsed() < Duration::from_millis(10)) {
+            return;
+        }
+        self.rel.0 -= dx;
+        self.rel.1 -= dy;
+        self.rel_sent = Instant::now();
+        let clamp = |v: f64| v.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        let b = self.mouse_buttons;
+        if let Some(s) = self.session() {
+            s.send(proto::mouse_rel(clamp(dx), clamp(dy), b, wheel));
+        }
+    }
+
+    fn apply_grab(&mut self, window: &Window) {
+        use winit::window::CursorGrabMode;
+        let Some(grab) = self.want_grab.take() else { return };
+        if grab && !self.grabbed && self.can_input() {
+            let ok = window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            if let Err(e) = ok {
+                log::warn!("could not capture the pointer: {e}");
+            }
+            window.set_cursor_visible(false);
+            self.grabbed = true;
+            self.rel = (0.0, 0.0);
+            if let Some(s) = self.session() {
+                s.send(proto::mouse_origin());
+            }
+        } else if !grab && self.grabbed {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            self.grabbed = false;
         }
     }
 
@@ -595,9 +1366,80 @@ impl ConsoleWindow {
                 self.sharing = None;
             }
         }
+        if let Some(saved) = self.saved_recording.clone() {
+            let mut close = false;
+            egui::Modal::new(egui::Id::unique("rec-saved")).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.heading(if saved.video { "Video saved" } else { "Recording saved" });
+                ui.add_space(4.0);
+                ui.label(format!("{} recorded.", super::mp4::describe(saved.len, saved.bytes)));
+                ui.weak(saved.path.display().to_string());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if saved.video {
+                        super::mp4::open_buttons(ui, &saved.path);
+                    } else {
+                        if ui.button("Play").clicked() {
+                            self.play_file = Some(saved.path.clone());
+                            close = true;
+                        }
+                        if ui.button("Show folder").clicked() {
+                            if let Some(dir) = saved.path.parent() {
+                                let _ = open::that(dir);
+                            }
+                        }
+                    }
+                    if ui.button("OK").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if close {
+                self.saved_recording = None;
+            }
+        }
+        if let Some(d) = self.ffmpeg_dialog.as_mut() {
+            match d.show(ctx) {
+                None => {}
+                Some(c) => {
+                    self.ffmpeg_dialog = None;
+                    match c {
+                        Choice::Found(_) => self.start_recording(true),
+                        Choice::Alternative => self.start_recording(false),
+                        Choice::Close => {}
+                    }
+                }
+            }
+        }
+        if self.closing {
+            if let Some(sv) = self.saving_video.as_mut() {
+                let mut cancel = false;
+                egui::Modal::new(egui::Id::unique("closing-video")).show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.heading("Saving the video");
+                    ui.add_space(4.0);
+                    ui.label("The window closes when the MP4 video is saved.");
+                    ui.weak(sv.job.out.display().to_string());
+                    ui.add_space(6.0);
+                    ui.add(egui::ProgressBar::new(sv.job.progress()).show_percentage());
+                    ui.add_space(6.0);
+                    cancel = ui.button("Cancel").on_hover_text("Close now and keep the .dvcrec recording instead").clicked();
+                });
+                if cancel {
+                    sv.job.cancel();
+                }
+            }
+        }
+        let write_error = self.recorder.lock().unwrap().as_ref().and_then(|w| w.error.clone());
+        if let Some(e) = write_error {
+            self.recorder.lock().unwrap().take();
+            self.rec_video = None;
+            self.message = Some(format!("Recording stopped: {e}"));
+        }
         if let Some(m) = self.message.clone() {
             let mut close = false;
             egui::Modal::new(egui::Id::unique("msg")).show(ctx, |ui| {
+                ui.set_max_width(480.0);
                 ui.label(m);
                 if ui.button("OK").clicked() {
                     close = true;
@@ -608,6 +1450,10 @@ impl ConsoleWindow {
             }
         }
     }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn power_label(state: u16) -> &'static str {
@@ -623,9 +1469,35 @@ fn led(ui: &mut egui::Ui, name: &str, on: bool) {
     ui.colored_label(c, name);
 }
 
+/// "2026-11-06_071530" (UTC), for file names.
 fn timestamp() -> String {
-    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    s.to_string()
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}_{:02}{:02}{:02}", rem / 3600, rem / 60 % 60, rem % 60)
+}
+
+/// `path`, or `name-2.ext`, `name-3.ext`, ... if it exists already.
+fn unused_path(path: &std::path::Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (1..)
+        .map(|i| if i == 1 { path.to_path_buf() } else { path.with_file_name(format!("{stem}-{i}{ext}")) })
+        .find(|p| !p.exists())
+        .expect("a free name")
+}
+
+pub(super) fn file_safe(name: &str) -> String {
+    name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '.', "_")
 }
 
 impl WindowUi for ConsoleWindow {
@@ -644,6 +1516,21 @@ impl WindowUi for ConsoleWindow {
     fn ui(&mut self, root: &mut egui::Ui, window: &Window, shell: &mut Shell) {
         let ctx = root.ctx().clone();
         self.poll();
+        self.poll_saving_video();
+        if self.closing && self.saving_video.is_none() && self.message.is_none() {
+            shell.close_me = true;
+        }
+        self.drive_retry(&ctx);
+        if self.session().is_none() && self.grabbed {
+            self.want_grab = Some(false);
+        }
+        self.apply_grab(window);
+        if self.grabbed {
+            self.flush_relative(false, 0);
+            if self.rel.0.abs() >= 1.0 || self.rel.1.abs() >= 1.0 {
+                ctx.request_repaint_after(Duration::from_millis(10));
+            }
+        }
         self.update_texture(&ctx);
         self.update_stats();
         egui::Panel::top("menu").show(root, |ui| self.menu(ui, window, shell));
@@ -664,14 +1551,53 @@ impl WindowUi for ConsoleWindow {
                     ui.separator();
                     ui.label(format!("{:.1} fps, {:.0} kbit/s", self.stats.fps, self.stats.kbps));
                 }
-                if self.can_input() && self.capture_keys {
+                if let Some(job) = &self.typing {
                     ui.separator();
-                    ui.weak(if self.hovering_video { "Keyboard → server" } else { "Point at the screen to type" });
+                    let done = job.done();
+                    ui.add(egui::ProgressBar::new(done as f32 / job.total.max(1) as f32).desired_width(140.0).text(format!("Typing {done}/{}", job.total)));
+                    if ui.small_button("Stop").clicked() {
+                        job.cancel();
+                    }
+                }
+                if let Some((t, at)) = &self.toast {
+                    if at.elapsed() < Duration::from_secs(3) {
+                        ui.separator();
+                        ui.label(t.as_str());
+                        ui.ctx().request_repaint_after(Duration::from_secs(3).saturating_sub(at.elapsed()));
+                    }
+                }
+                if self.grabbed {
+                    ui.separator();
+                    ui.strong("Single cursor: press F9 to release the pointer");
+                } else if self.session().is_some() && (self.user_view_only || self.view_only) {
+                    ui.separator();
+                    ui.weak("View only: keyboard and mouse are not sent");
+                } else if self.can_input() && self.capture_keys {
+                    ui.separator();
+                    ui.weak(if self.hovering_video { "Keyboard goes to the server" } else { "Point at the screen to type" });
                 }
             });
         });
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::BLACK)).show(root, |ui| self.video(ui));
         self.dialogs(&ctx);
+        self.type_dialog(&ctx);
+        if let Some(p) = self.play_file.take() {
+            shell.open.push(Box::new(super::PlaybackWindow::from_file(p)));
+        }
+        if self.typing.as_ref().is_some_and(|j| j.finished()) {
+            self.typing = None;
+        }
+        if self.show_about {
+            egui::Modal::new(egui::Id::unique("about")).show(&ctx, |ui| {
+                ui.heading(format!("idrac6 {}", env!("CARGO_PKG_VERSION")));
+                ui.label("Virtual console, virtual media and web UI proxy for Dell iDRAC6.");
+                ui.hyperlink("https://github.com/skylord123/idrac6-rs");
+                ui.weak("MIT licensed. Not affiliated with Dell or Vertiv/Avocent.");
+                if ui.button("Close").clicked() {
+                    self.show_about = false;
+                }
+            });
+        }
         let kvm = match &self.phase {
             Phase::Connected(s) if !s.is_closed() => Some(s),
             _ => None,
@@ -685,14 +1611,28 @@ impl WindowUi for ConsoleWindow {
     fn raw_key(&mut self, ev: &KeyEvent) -> bool {
         // Keys go to the server while the pointer is over the video and no
         // dialog is open, like a KVM switch.
-        let modal_open = self.confirm_power.is_some() || self.sharing.is_some() || self.message.is_some();
+        let modal_open = self.confirm_power.is_some()
+            || self.sharing.is_some()
+            || self.message.is_some()
+            || self.show_about
+            || self.type_text.is_some()
+            || self.saved_recording.is_some()
+            || self.ffmpeg_dialog.is_some()
+            || self.closing;
         // Over the Virtual Media window the keyboard belongs to egui.
         if !self.capture_keys || !self.can_input() || modal_open {
             return false;
         }
         let PhysicalKey::Code(code) = ev.physical_key else { return false };
         let pressed = ev.state == ElementState::Pressed;
-        if !self.hovering_video && !self.pressed.contains(&keymap::hid_usage(code).unwrap_or(0)) {
+        if self.grabbed && code == KeyCode::F9 {
+            if pressed {
+                self.want_grab = Some(false);
+                self.repaint();
+            }
+            return true;
+        }
+        if !self.grabbed && !self.hovering_video && !self.pressed.contains(&keymap::hid_usage(code).unwrap_or(0)) {
             return false;
         }
         let Some(u) = keymap::hid_usage(code) else { return code != KeyCode::Fn };
@@ -707,7 +1647,24 @@ impl WindowUi for ConsoleWindow {
         true
     }
 
+    fn raw_mouse_motion(&mut self, dx: f64, dy: f64) -> bool {
+        if !self.grabbed {
+            return false;
+        }
+        self.rel.0 += dx;
+        self.rel.1 += dy;
+        self.flush_relative(false, 0);
+        true
+    }
+
     fn focus_changed(&mut self, focused: bool) {
+        self.focused = focused;
+        if !focused && self.grabbed {
+            self.want_grab = Some(false);
+        }
+        if let Some(s) = self.session() {
+            s.set_focus(focused);
+        }
         if !focused {
             // Otherwise e.g. Alt stays pressed on the server after Alt-Tab.
             self.release_all_keys();
@@ -717,14 +1674,51 @@ impl WindowUi for ConsoleWindow {
     }
 
     fn close_requested(&mut self) -> bool {
+        if self.closing {
+            // Asked again while the video is saved: keep waiting; the
+            // dialog has Cancel.
+            return self.saving_video.is_none();
+        }
+        if self.rec_video.is_some() {
+            self.stop_recording();
+        } else if let Some(w) = self.recorder.lock().unwrap().take() {
+            if let Err(e) = w.finish() {
+                log::error!("{e:#}");
+            }
+        }
+        if self.saving_video.is_some() {
+            // Disconnect now, close once the video is saved.
+            self.closing = true;
+            self.retry = None;
+            self.disconnect_all();
+            return false;
+        }
+        self.disconnect_all();
+        // The web session is logged out in Drop.
+        true
+    }
+}
+
+impl ConsoleWindow {
+    fn disconnect_all(&mut self) {
         self.release_all_keys();
         self.vm.disconnect();
         if let Phase::Connected(s) = &self.phase {
             s.close();
         }
+    }
+}
+
+impl Drop for ConsoleWindow {
+    fn drop(&mut self) {
+        // Log out synchronously: a background thread would be killed when
+        // the app exits, leaving the session open on the iDRAC, which only
+        // allows a few at a time.
         if let Some(w) = self.web.take() {
-            thread::spawn(move || w.logout());
+            let _ = w.logout();
         }
-        true
+        for w in std::mem::take(&mut *self.old_webs.lock().unwrap()) {
+            let _ = w.logout();
+        }
     }
 }

@@ -4,8 +4,13 @@
 //! events (modifiers, Super, PrintScreen, keypad, Ctrl+C, ...) that egui
 //! swallows or does not model.
 
+mod clipboard;
 mod console;
+mod health;
 mod manager;
+mod monitor;
+mod mp4;
+mod playback;
 mod vmedia;
 
 use std::collections::HashMap;
@@ -26,11 +31,15 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 pub use console::ConsoleWindow;
 pub use manager::ManagerWindow;
+pub use playback::PlaybackWindow;
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     /// Repaint a window, optionally after a delay.
     Repaint(WindowId, std::time::Duration),
+    /// Ctrl+C or SIGTERM: close every window (logging out of the iDRACs)
+    /// and exit.
+    Quit,
 }
 
 /// Window attributes shared by all windows: icon and the application id
@@ -75,6 +84,11 @@ pub trait WindowUi {
         false
     }
     fn focus_changed(&mut self, _focused: bool) {}
+    /// Raw relative mouse motion from the device (not limited by the window
+    /// edge). Return true to request a redraw.
+    fn raw_mouse_motion(&mut self, _dx: f64, _dy: f64) -> bool {
+        false
+    }
     /// The user asked to close the window. Return false to keep it open.
     fn close_requested(&mut self) -> bool {
         true
@@ -85,12 +99,14 @@ pub trait WindowUi {
     }
 }
 
+// Fields drop in declaration order: the GL surface and context must go
+// before the native window, or X11 reports GLXBadWindow on close.
 struct GlWin {
-    window: Arc<Window>,
+    ui: Box<dyn WindowUi>,
+    egui: egui_glow::EguiGlow,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
-    egui: egui_glow::EguiGlow,
-    ui: Box<dyn WindowUi>,
+    window: Arc<Window>,
     next_repaint: Option<Instant>,
 }
 
@@ -104,6 +120,12 @@ struct App {
 pub fn run(first: Box<dyn WindowUi>) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+    let quit = proxy.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        let _ = quit.send_event(UserEvent::Quit);
+    }) {
+        log::warn!("cannot handle Ctrl+C: {e}");
+    }
     let mut app = App { proxy, gl_config: None, windows: HashMap::new(), pending: vec![first] };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -198,6 +220,9 @@ impl App {
 
     fn close(&mut self, el: &ActiveEventLoop, id: WindowId) {
         if let Some(mut w) = self.windows.remove(&id) {
+            // Dropping the UI can take a moment (logging out of iDRACs);
+            // make the window disappear right away.
+            w.window.set_visible(false);
             let _ = w.context.make_current(&w.surface);
             w.egui.destroy();
             if w.ui.is_main() {
@@ -255,8 +280,25 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, ev: UserEvent) {
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        if let winit::event::DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            for w in self.windows.values_mut() {
+                if w.ui.raw_mouse_motion(dx, dy) {
+                    w.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         match ev {
+            UserEvent::Quit => {
+                log::info!("quitting on signal");
+                for w in self.windows.values_mut() {
+                    w.ui.close_requested();
+                }
+                el.exit();
+            }
             UserEvent::Repaint(id, delay) => {
                 if let Some(w) = self.windows.get_mut(&id) {
                     if delay.is_zero() {
@@ -297,6 +339,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         for (_, mut w) in self.windows.drain() {
+            w.window.set_visible(false);
             let _ = w.context.make_current(&w.surface);
             w.egui.destroy();
         }

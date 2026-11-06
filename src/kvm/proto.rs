@@ -73,6 +73,9 @@ pub mod ty {
 
     // server -> client, video channel (8 bit type)
     pub const VIDEO_DVC: u8 = 0x80;
+    /// Avocent DVC "Video Packet" types used by iDRAC6.
+    pub const VIDEO_DVC_FIRST: u8 = 0x81;
+    pub const VIDEO_DVC_LAST: u8 = 0x83;
     pub const VIDEO_CONNECT_STATUS: u8 = 0x84;
     pub const VIDEO_STOPPED: u8 = 0x85;
     pub const VIDEO_ASPEED: u8 = 0x86;
@@ -339,12 +342,50 @@ pub fn mouse_abs(x: u16, y: u16, buttons: u8, wheel: i16) -> Vec<u8> {
     beef(ty::MOUSE_ABS, &p)
 }
 
+/// Relative mouse movement (single cursor mode). Same layout as
+/// [`mouse_abs`] but `dx`/`dy` are signed deltas.
+pub fn mouse_rel(dx: i16, dy: i16, buttons: u8, wheel: i16) -> Vec<u8> {
+    let mut p = [0u8; 8];
+    p[1] = buttons;
+    p[2..4].copy_from_slice(&dx.to_be_bytes());
+    p[4..6].copy_from_slice(&dy.to_be_bytes());
+    p[6..8].copy_from_slice(&wheel.to_be_bytes());
+    beef(ty::MOUSE_REL, &p)
+}
+
+/// Re-centre the server's pointer before relative movement starts.
+pub fn mouse_origin() -> Vec<u8> {
+    beef(ty::MOUSE_ORIGIN, &[0; 8])
+}
+
 pub fn focus(has_focus: bool) -> Vec<u8> {
     beef(ty::FOCUS, &[has_focus as u8, 0, 0, 0, 0, 0, 0, 0])
 }
 
 pub fn keyboard_led_request() -> Vec<u8> {
     beef(ty::KEYBOARD_LED_REQUEST, &[0; 8])
+}
+
+/// How the iDRAC scales mouse movement; should match the server OS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseAccel {
+    None = 0,
+    Windows = 1,
+    Linux = 2,
+}
+
+impl MouseAccel {
+    pub const ALL: [MouseAccel; 3] = [Self::Windows, Self::Linux, Self::None];
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| *a as u8 == v)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Windows => "Windows",
+            Self::Linux => "Linux",
+        }
+    }
 }
 
 pub fn mouse_accel(value: u8) -> Vec<u8> {
@@ -555,7 +596,8 @@ pub fn parse_sharing_request(p: &[u8]) -> SharingRequest {
     }
 }
 
-/// Keyboard LED state.
+/// Keyboard LED state. The byte uses the PS/2 keyboard LED order:
+/// bit 0 Scroll Lock, bit 1 Num Lock, bit 2 Caps Lock.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Leds {
     pub num: bool,
@@ -565,7 +607,7 @@ pub struct Leds {
 
 pub fn parse_leds(p: &[u8]) -> Leds {
     let b = p.first().copied().unwrap_or(0);
-    Leds { num: b & 1 != 0, caps: b & 2 != 0, scroll: b & 4 != 0 }
+    Leds { scroll: b & 1 != 0, num: b & 2 != 0, caps: b & 4 != 0 }
 }
 
 pub fn parse_resolution(p: &[u8]) -> (u16, u16) {
@@ -575,6 +617,13 @@ pub fn parse_resolution(p: &[u8]) -> (u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn led_bits() {
+        assert_eq!(parse_leds(&[1]), Leds { scroll: true, ..Default::default() });
+        assert_eq!(parse_leds(&[2]), Leds { num: true, ..Default::default() });
+        assert_eq!(parse_leds(&[4]), Leds { caps: true, ..Default::default() });
+    }
 
     #[test]
     fn beef_header() {

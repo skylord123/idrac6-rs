@@ -191,7 +191,7 @@ All have an 8 byte payload unless stated otherwise.
 
 | Type | Name | Payload |
 |---|---|---|
-| `0x8100` | Keyboard LEDs | `bits8`: 1 num, 2 caps, 4 scroll |
+| `0x8100` | Keyboard LEDs | `bits8`: 1 scroll, 2 num, 4 caps (PS/2 LED order) |
 | `0x8101` | Mouse ack | `count8` |
 | `0x8102` | Mouse acceleration | `value8` |
 | `0x8200` | Input resolution | `w16 h16` |

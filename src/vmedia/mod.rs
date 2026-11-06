@@ -249,6 +249,9 @@ struct PendingMap {
     image: VmImage,
     reply: Sender<Result<()>>,
     deadline: Instant,
+    /// Ask for the drive table again at this time (the iDRAC was still
+    /// bringing up its virtual USB device).
+    retry_at: Option<Instant>,
 }
 
 struct Worker<S: Read + Write> {
@@ -327,7 +330,13 @@ impl<S: Read + Write> Worker<S> {
             if let Some(p) = &self.pending
                 && Instant::now() > p.deadline
             {
-                self.fail_pending("the iDRAC did not report its virtual drives");
+                self.fail_pending("no free virtual drive on the iDRAC. Check that Virtual Media is set to Attach or Auto-attach (iDRAC web UI: System > Console/Media > Configuration) and that nobody else has it in use.");
+            }
+            if let Some(p) = self.pending.as_mut()
+                && p.retry_at.is_some_and(|t| Instant::now() >= t)
+            {
+                p.retry_at = None;
+                self.send(&proto::get_vdisk_info())?;
             }
             if self.last_sent.elapsed() >= HEARTBEAT_EVERY {
                 self.send(&proto::heartbeat())?;
@@ -370,7 +379,7 @@ impl<S: Read + Write> Worker<S> {
         }
         // Refresh the drive table first, like the Java client.
         self.send(&proto::get_vdisk_info())?;
-        self.pending = Some(PendingMap { image: img, reply, deadline: Instant::now() + MAP_TIMEOUT });
+        self.pending = Some(PendingMap { image: img, reply, deadline: Instant::now() + MAP_TIMEOUT, retry_at: None });
         Ok(())
     }
 
@@ -458,8 +467,16 @@ impl<S: Read + Write> Worker<S> {
                     self.connected_sent = true;
                     self.event(VmEvent::Connected { drives: self.drives.clone() });
                 }
-                if let Some(p) = self.pending.take() {
-                    self.finish_map(p)?;
+                if let Some(mut p) = self.pending.take() {
+                    // Right after connecting in auto-attach mode the drives
+                    // report "disabled" for a moment; wait for them.
+                    let attaching = self.drives.iter().any(|d| d.status == proto::DRIVE_STATUS_DISABLED);
+                    if self.free_drive(p.image.kind).is_none() && attaching && Instant::now() < p.deadline {
+                        p.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                        self.pending = Some(p);
+                    } else {
+                        self.finish_map(p)?;
+                    }
                 }
             }
             Incoming::Read { disk, start, blocks, blocking_factor } => {

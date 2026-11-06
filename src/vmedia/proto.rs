@@ -76,6 +76,11 @@ pub const REMOTE_TYPE_REMOVABLE: u8 = 4;
 
 /// Remote drive status in VDISK_INFO.
 pub const DRIVE_STATUS_IDLE: u8 = 0;
+/// Drive slot in use by a mapping.
+pub const DRIVE_STATUS_ATTACHED: u8 = 1;
+/// Drive slot unavailable; also reported briefly while the iDRAC brings up
+/// its virtual USB device in auto-attach mode.
+pub const DRIVE_STATUS_DISABLED: u8 = 2;
 
 /// The fixed READ TOC (format 0) blob the Java client sends for every ISO
 /// image: one data track starting at LBA 0, lead-out at 74:12:60 MSF.
@@ -451,14 +456,16 @@ pub fn disconnect_reason_text(reason: u8) -> &'static str {
 
 /// Device status codes from DEVICE_STATUS. `None` means "not an error".
 pub fn device_status_error(status: i32) -> Option<&'static str> {
+    // Like the Java client: only these codes are errors; 0 (seen right after
+    // a successful map), 1, 3, 7 and anything unlisted are informational.
     match status {
-        1 | 3 | 7 => None,
         2 => Some("read failed"),
         4 => Some("mapping failed: the virtual USB device is not connected"),
         5 => Some("mapping failed: the drive is already attached"),
         6 => Some("drive released by the iDRAC"),
         8 => Some("mapping failed"),
-        _ => Some("unknown device error"),
+        -1 => Some("unknown device error"),
+        _ => None,
     }
 }
 

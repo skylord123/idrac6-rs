@@ -80,7 +80,7 @@ in use, 22/23 authentication server errors.
   idle (free), 1 attached, 2 disabled, 3 broken.
 * A CD image (ISO) is mapped on the first idle drive of type 2:
   `VDISK_REQUEST (528)`: `disk16 block_size32=2048 blocks32 ro8=1
-  min(blocks,255)8 toc_len16 toc[toc_len]`, where `blocks = size/2048 - 1`
+  min(blocks,255)8 toc_len16 toc[toc_len]`, where `blocks = ceil(size/2048)` (Dell's client sends `size/2048 - 1`, which hides the last 2 KiB of the image from the server)
   and the TOC is the fixed 20-byte blob in `proto::ISO_TOC`.
 * A floppy/removable image (IMG) is mapped on the first idle drive of type
   1 or 4: `VDISK_REQUEST2 (529)`: `disk16 block_size32=512 blocks32 ro8
