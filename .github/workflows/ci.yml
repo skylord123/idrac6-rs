@@ -1,74 +1,125 @@
 name: CI
 
+# Every push and pull request is tested and packaged (the packages are
+# kept as workflow artifacts). Pushing a tag `vX.Y.Z` also publishes a
+# GitHub release with all packages.
+
 on:
   push:
     branches: [master, dev]
     tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  # Inno Setup used for the Windows installer.
+  INNO_VERSION: 6.7.4
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            name: linux-x86_64
-            exe: idrac6
-          - os: windows-latest
-            name: windows-x86_64
-            exe: idrac6.exe
-    runs-on: ${{ matrix.os }}
+  linux:
+    # The oldest supported runner, so the binary runs on older glibc too.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install D-Bus headers (system keyring)
-        if: runner.os == 'Linux'
+      - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Check the version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$want" != "$have" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $have in Cargo.toml"
+            exit 1
+          fi
+      - name: Test
+        run: cargo test --features vendored-openssl
+      - name: Build
+        run: cargo build --release --features vendored-openssl
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+      - name: Package
+        run: |
+          mkdir -p dist pkg/idrac6
+          cp target/release/idrac6 README.md LICENSE pkg/idrac6/
+          cp assets/idrac6.desktop assets/icon-256.png pkg/idrac6/
+          tar -C pkg -czf dist/idrac6-linux-x86_64.tar.gz idrac6
+          cargo deb --no-build --output dist/idrac6-amd64.deb
+          cargo generate-rpm --output dist/idrac6-x86_64.rpm
+      - name: Check the packages
+        run: |
+          dpkg-deb --info dist/idrac6-amd64.deb
+          dpkg-deb --contents dist/idrac6-amd64.deb | grep -q usr/bin/idrac6
+          tar -tzf dist/idrac6-linux-x86_64.tar.gz | grep -q idrac6/idrac6
+          ./pkg/idrac6/idrac6 --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: idrac6-linux
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install NASM (OpenSSL build)
-        if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
       - name: Test
         run: cargo test --features vendored-openssl
       - name: Build
         run: cargo build --release --features vendored-openssl
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir dist
-          cp target/release/${{ matrix.exe }} README.md LICENSE dist/
-          tar -C dist -czf idrac6-${{ matrix.name }}.tar.gz .
-          cargo install cargo-deb --locked
-          cargo deb --no-build --output idrac6-amd64.deb
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
+      - name: Install Inno Setup
         shell: pwsh
         run: |
-          New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/release/${{ matrix.exe }}, README.md, LICENSE dist/
-          Compress-Archive -Path dist/* -DestinationPath idrac6-${{ matrix.name }}.zip
+          $tag = "is-" + $env:INNO_VERSION.Replace('.', '_')
+          $url = "https://github.com/jrsoftware/issrc/releases/download/$tag/innosetup-$env:INNO_VERSION.exe"
+          Invoke-WebRequest $url -OutFile innosetup.exe
+          Start-Process innosetup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/DIR=C:\InnoSetup' -Wait
+          if (-not (Test-Path C:\InnoSetup\ISCC.exe)) { throw "Inno Setup did not install" }
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          New-Item -ItemType Directory dist, pkg | Out-Null
+          Copy-Item target/release/idrac6.exe, README.md pkg/
+          Copy-Item LICENSE pkg/LICENSE.txt
+          Compress-Archive -Path pkg/* -DestinationPath dist/idrac6-windows-x86_64.zip
+          & C:\InnoSetup\ISCC.exe /Q "/DAppVersion=$version" packaging\windows\idrac6.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Copy-Item target/installer/idrac6-windows-x86_64-setup.exe dist/
+      - name: Check the installer
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\idrac6-install"
+          Start-Process dist/idrac6-windows-x86_64-setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', "/DIR=$dir" -Wait
+          if (-not (Test-Path "$dir\idrac6.exe")) { throw "the installer did not install idrac6.exe" }
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait
       - uses: actions/upload-artifact@v4
         with:
-          name: idrac6-${{ matrix.name }}
-          path: |
-            idrac6-${{ matrix.name }}.*
-            idrac6-amd64.deb
+          name: idrac6-windows
+          path: dist/*
+          if-no-files-found: error
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [linux, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          path: dist
           merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
-          files: idrac6-*
+          files: dist/*
           generate_release_notes: true
+          fail_on_unmatched_files: true

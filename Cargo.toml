@@ -70,6 +70,40 @@ assets = [
     ["docs/*.md", "usr/share/doc/idrac6/", "644"],
 ]
 
+# `cargo generate-rpm` (after a release build) builds a Fedora/openSUSE
+# package. Library dependencies are found automatically; the ones below
+# are loaded at runtime and are listed by the capability every RPM
+# distribution provides.
+[package.metadata.generate-rpm]
+name = "idrac6"
+summary = "Native virtual console and virtual media for Dell iDRAC6"
+license = "MIT"
+assets = [
+    { source = "target/release/idrac6", dest = "/usr/bin/idrac6", mode = "755" },
+    { source = "assets/idrac6.desktop", dest = "/usr/share/applications/idrac6.desktop", mode = "644" },
+    { source = "assets/icon-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-24.png", dest = "/usr/share/icons/hicolor/24x24/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/idrac6.png", mode = "644" },
+    { source = "assets/icon-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/idrac6.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/idrac6/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/idrac6/LICENSE", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+"libxkbcommon.so.0()(64bit)" = "*"
+"libxkbcommon-x11.so.0()(64bit)" = "*"
+"libEGL.so.1()(64bit)" = "*"
+
+[package.metadata.generate-rpm.recommends]
+openssh-clients = "*"
+
+[package.metadata.generate-rpm.suggests]
+ffmpeg = "*"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

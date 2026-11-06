@@ -36,12 +36,19 @@ one program.
 Download the latest build from the
 [releases page](https://github.com/skylord123/idrac6-rs/releases):
 
+- **Windows**: `idrac6-windows-x86_64-setup.exe` installs idrac6 with a
+  Start menu entry (no admin rights needed; it installs for your user
+  unless you choose all users). Or take `idrac6-windows-x86_64.zip`,
+  unzip it anywhere and run `idrac6.exe`.
 - **Ubuntu / Debian**: `idrac6-amd64.deb`. Install it with
   `sudo apt install ./idrac6-amd64.deb`, then start *iDRAC6 Console* from
   your applications menu.
-- **Windows**: `idrac6-windows-x86_64.zip`. Unzip and run `idrac6.exe`.
-- **Other Linux**: `idrac6-linux-x86_64.tar.gz`. Extract and run
-  `./idrac6`. Needs a desktop with OpenGL (X11 or Wayland).
+- **Fedora / openSUSE**: `idrac6-x86_64.rpm`. Install it with
+  `sudo dnf install ./idrac6-x86_64.rpm` (or `sudo zypper install`).
+- **Other Linux**: `idrac6-linux-x86_64.tar.gz`. Extract it and run
+  `idrac6/idrac6`. Needs a desktop with OpenGL (X11 or Wayland).
+
+`SHA256SUMS.txt` has the checksums of all files.
 
 MP4 videos need [FFmpeg](https://ffmpeg.org/download.html), which is not
 included: `sudo apt install ffmpeg` on Ubuntu/Debian, `winget install
@@ -69,6 +76,21 @@ To build the Debian package (binary, menu entry and icons):
 cargo install cargo-deb
 cargo deb --features vendored-openssl    # -> target/debian/idrac6_*.deb
 ```
+
+The RPM is built the same way with `cargo install cargo-generate-rpm`,
+`cargo build --release --features vendored-openssl` and `cargo
+generate-rpm`. The Windows installer needs
+[Inno Setup](https://jrsoftware.org/isinfo.php) 6.3 or newer: build the
+release executable, then run `iscc /DAppVersion=X.Y.Z
+packaging\windows\idrac6.iss` (it is written to `target\installer\`).
+
+### Releases
+
+Pushing a tag `vX.Y.Z` (matching the version in `Cargo.toml`) makes the
+CI workflow test everything, build all the packages above on Linux and
+Windows, check that the installer installs, and publish them on a GitHub
+release with checksums. Every other push and pull request builds the same
+packages as downloadable workflow artifacts.
 
 ## Usage
 
