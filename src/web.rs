@@ -216,9 +216,15 @@ impl WebSession {
         Ok(r.body)
     }
 
-    pub fn logout(&self) {
-        if let Err(e) = self.get("/data/logout") {
-            log::debug!("logout failed: {e:#}");
+    /// End the session. Returns false if the iDRAC could not be reached
+    /// (the session then stays open on the iDRAC until it times out).
+    pub fn logout(&self) -> bool {
+        match self.get("/data/logout") {
+            Ok(_) => true,
+            Err(e) => {
+                log::debug!("logout failed: {e:#}");
+                false
+            }
         }
     }
 }

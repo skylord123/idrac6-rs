@@ -77,7 +77,7 @@ impl PlaybackWindow {
         thread::spawn(move || {
             let r = WebSession::login(&inst.host, inst.https_port, &inst.username, &inst.password).and_then(|w| {
                 let r = f(&w);
-                w.logout();
+                let _ = w.logout();
                 r
             });
             let _ = tx.send(r);

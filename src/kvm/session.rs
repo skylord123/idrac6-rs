@@ -53,6 +53,9 @@ pub enum KvmEvent {
     /// Credentials for the virtual media channel (answer to
     /// [`KvmSession::request_vm_credentials`]).
     VmCredentials { user: String, password: String },
+    /// The iDRAC announced why it is about to end the session (see
+    /// `docs/protocol.md`, message `0x8301`). Followed by `Disconnected`.
+    DisconnectReason(u8),
     Disconnected(String),
 }
 
@@ -393,6 +396,7 @@ fn command_thread(ctx: &Ctx, outgoing: Receiver<Vec<u8>>) -> Result<()> {
                 ty::SHARING_REQUEST => ctx.send(KvmEvent::SharingRequest(proto::parse_sharing_request(&m.payload))),
                 ty::USER_DISCONNECT_PENDING => {
                     let reason = m.payload.first().copied().unwrap_or(0);
+                    ctx.send(KvmEvent::DisconnectReason(reason));
                     bail!("{}", disconnect_reason(reason));
                 }
                 t if t & 0xff00 == 0x8600 || t & 0xff00 == 0x8500 => {

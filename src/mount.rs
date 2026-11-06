@@ -72,7 +72,7 @@ pub fn run(inst: Instance, image: PathBuf, kind: Option<DriveKind>, read_write: 
         kvm.close();
         Ok(())
     })();
-    web.logout();
+    let _ = web.logout();
     result
 }
 

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,57 @@ pub struct ConsoleWindow {
     typing: Option<TypeJob>,
     /// Short-lived note in the status bar ("Screenshot copied").
     toast: Option<(String, Instant)>,
+    /// Tools → Reconnect automatically.
+    auto_reconnect: bool,
+    /// An automatic reconnect sequence is under way.
+    retry: Option<Retry>,
+    /// The current session got as far as showing the console.
+    was_running: bool,
+    /// Why the iDRAC said it ended the session, if it did.
+    end_reason: Option<u8>,
+    /// The picture is left over from a previous session.
+    stale: bool,
+    /// Web sessions of earlier connections that still need logging out
+    /// (the logout failed while the iDRAC was unreachable).
+    old_webs: Arc<Mutex<Vec<Arc<WebSession>>>>,
+}
+
+struct Notice {
+    title: String,
+    detail: String,
+    /// Secondary line, e.g. why the last attempt failed.
+    note: Option<String>,
+    spinner: bool,
+    error: bool,
+    buttons: Vec<NoticeButton>,
+}
+
+#[derive(Clone, Copy)]
+enum NoticeButton {
+    ReconnectNow,
+    StopRetry,
+    TryAgain,
+    AskShare,
+}
+
+struct Retry {
+    attempt: u32,
+    /// When the next attempt starts; `None` while one is in progress.
+    at: Option<Instant>,
+    /// Why the connection was lost.
+    reason: String,
+    /// Why the latest reconnect attempt failed.
+    last_error: Option<String>,
+}
+
+/// Why a connection attempt or session failed.
+enum Failure {
+    /// Web login or downloading the console tokens.
+    WebLogin,
+    /// The console refused the login.
+    ConsoleLogin,
+    /// An established session ended.
+    Lost,
 }
 
 #[derive(Default)]
@@ -159,6 +210,12 @@ impl ConsoleWindow {
             type_speed: Speed::Normal,
             typing: None,
             toast: None,
+            auto_reconnect: true,
+            retry: None,
+            was_running: false,
+            end_reason: None,
+            stale: false,
+            old_webs: Arc::default(),
         }
     }
 
@@ -187,7 +244,7 @@ impl ConsoleWindow {
                 match web.console_info() {
                     Ok(info) => Ok((web, info)),
                     Err(e) => {
-                        web.logout();
+                        let _ = web.logout();
                         Err(e)
                     }
                 }
@@ -314,16 +371,27 @@ impl ConsoleWindow {
         if let Phase::LoggingIn(rx) = &self.phase {
             match rx.try_recv() {
                 Ok(Ok((web, info))) => {
+                    // The iDRAC is reachable again: end the sessions whose
+                    // logout failed earlier.
+                    let old = std::mem::take(&mut *self.old_webs.lock().unwrap());
+                    if !old.is_empty() {
+                        let back = self.old_webs.clone();
+                        thread::spawn(move || {
+                            for w in old {
+                                if !w.logout() {
+                                    back.lock().unwrap().push(w);
+                                }
+                            }
+                        });
+                    }
                     self.web = Some(Arc::new(web));
                     self.info = Some(info);
                     self.status = "Connecting to the virtual console…".into();
                     self.connect(self.pending_shared);
                 }
-                Ok(Err(e)) => {
-                    self.phase = Phase::Failed(format!("{e:#}"));
-                }
+                Ok(Err(e)) => self.failed(format!("{e:#}"), Failure::WebLogin),
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.phase = Phase::Failed("login thread died".into()),
+                Err(mpsc::TryRecvError::Disconnected) => self.failed("login thread died".into(), Failure::WebLogin),
             }
         }
         let mut events = Vec::new();
@@ -337,14 +405,18 @@ impl ConsoleWindow {
                 KvmEvent::Status(s) => self.status = s,
                 KvmEvent::Running => {
                     self.status = "Connected".into();
+                    self.was_running = true;
+                    self.retry = None;
+                    self.end_reason = None;
                     if let Phase::Connected(s) = &self.phase {
                         s.set_focus(self.focused);
                     }
                 }
                 KvmEvent::LoginFailed(r) => {
                     self.in_use_retry = r.contains("already in use");
-                    self.phase = Phase::Failed(r);
+                    self.failed(r, Failure::ConsoleLogin);
                 }
+                KvmEvent::DisconnectReason(c) => self.end_reason = Some(c),
                 KvmEvent::ViewOnly => self.view_only = true,
                 KvmEvent::Resolution(w, h) => self.resolution = Some((w, h)),
                 KvmEvent::Leds(l) => self.leds = l,
@@ -362,10 +434,60 @@ impl ConsoleWindow {
                 }
                 KvmEvent::Disconnected(m) => {
                     if !matches!(self.phase, Phase::Failed(_)) {
-                        self.phase = Phase::Failed(m);
+                        self.failed(m, Failure::Lost);
                     }
                 }
             }
+        }
+    }
+
+    /// Record a failure and decide whether to reconnect automatically.
+    fn failed(&mut self, msg: String, kind: Failure) {
+        if let Phase::Connected(s) = &self.phase {
+            s.close();
+        }
+        let retrying = self.retry.is_some();
+        let again = self.auto_reconnect
+            && match kind {
+                // The connection dropped (network, iDRAC reboot, idle
+                // timeout). Not when someone ended it on purpose: an admin,
+                // a local user taking over, or the primary user going
+                // exclusive.
+                Failure::Lost => (self.was_running || retrying) && !matches!(self.end_reason, Some(1 | 3 | 6)),
+                // While the iDRAC reboots, logging in fails for a while.
+                // Wrong credentials will not fix themselves, though, and
+                // retrying them could lock the address out.
+                Failure::WebLogin => retrying && !msg.contains("wrong username or password") && !msg.contains("not allowed to log in"),
+                Failure::ConsoleLogin => false,
+            };
+        if again {
+            let attempt = self.retry.as_ref().map_or(0, |r| r.attempt) + 1;
+            let delay = [2, 5, 10, 20, 30][(attempt as usize - 1).min(4)];
+            let (reason, last_error) = match self.retry.take() {
+                Some(r) => (r.reason, Some(msg.clone())),
+                None => (msg.clone(), None),
+            };
+            log::info!("connection lost ({msg}); reconnecting in {delay} s (attempt {attempt})");
+            self.retry = Some(Retry { attempt, at: Some(Instant::now() + Duration::from_secs(delay)), reason, last_error });
+        } else {
+            self.retry = None;
+        }
+        self.was_running = false;
+        self.phase = Phase::Failed(msg);
+    }
+
+    /// Start the next automatic reconnect attempt when it is due.
+    fn drive_retry(&mut self, ctx: &egui::Context) {
+        let Some(at) = self.retry.as_ref().and_then(|r| r.at) else { return };
+        let now = Instant::now();
+        if now >= at {
+            if let Some(r) = self.retry.as_mut() {
+                r.at = None;
+            }
+            self.start_reconnect(false);
+        } else {
+            // Once a second for the countdown.
+            ctx.request_repaint_after((at - now).min(Duration::from_secs(1)));
         }
     }
 
@@ -384,6 +506,7 @@ impl ConsoleWindow {
         let img = egui::ColorImage::new([fb.width, fb.height], px);
         drop(fb);
         self.shown_seq = seq;
+        self.stale = false;
         match &mut self.texture {
             Some(t) => t.set(img, egui::TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("console", img, egui::TextureOptions::LINEAR)),
@@ -583,6 +706,8 @@ impl ConsoleWindow {
                             }
                         }
                     });
+                    ui.checkbox(&mut self.auto_reconnect, "Reconnect automatically")
+                        .on_hover_text("Reconnect when the connection drops, e.g. while the iDRAC reboots");
                     ui.separator();
                     ui.checkbox(&mut self.show_stats, "Statistics");
                 });
@@ -610,43 +735,147 @@ impl ConsoleWindow {
         });
     }
 
+    /// Reconnect now (user request). Ends any automatic reconnect sequence.
     fn reconnect(&mut self, shared: bool) {
+        self.retry = None;
+        self.start_reconnect(shared);
+    }
+
+    fn start_reconnect(&mut self, shared: bool) {
         if let Phase::Connected(s) = &self.phase {
             s.close();
         }
-        self.texture = None;
+        // Keep showing the last picture until the new session sends one.
+        self.stale = self.texture.is_some();
         self.shown_seq = 0;
+        self.was_running = false;
+        self.end_reason = None;
+        self.video_state = None;
+        self.want_grab = Some(false);
         self.view_only = false;
         self.pressed.clear();
         // Session tokens are single use, so always fetch fresh ones.
         if let Some(w) = self.web.take() {
-            thread::spawn(move || w.logout());
+            let old = self.old_webs.clone();
+            thread::spawn(move || {
+                if !w.logout() {
+                    old.lock().unwrap().push(w);
+                }
+            });
         }
         self.pending_shared = shared;
         self.start_login();
     }
 
-    fn video(&mut self, ui: &mut egui::Ui) {
-        let avail = ui.available_size();
-        let Some(tex) = &self.texture else {
-            let failed = match &self.phase {
-                Phase::Failed(m) if !m.is_empty() => Some(m.clone()),
-                _ => None,
-            };
-            if let Some(m) = failed {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(avail.y / 3.0);
-                        ui.colored_label(ui.visuals().error_fg_color, m);
-                        ui.add_space(8.0);
-                        if ui.button("Try again").clicked() {
-                            self.reconnect(false);
+    /// What to tell the user about the connection, if anything.
+    fn connection_notice(&self) -> Option<Notice> {
+        if let Some(r) = &self.retry {
+            return Some(match r.at {
+                Some(at) => {
+                    let secs = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u64;
+                    let attempt = if r.attempt > 1 { format!(" (attempt {})", r.attempt) } else { String::new() };
+                    Notice {
+                        title: "Connection lost".into(),
+                        detail: format!("{}\nReconnecting in {secs} s{attempt}…", r.reason),
+                        note: r.last_error.as_ref().map(|e| format!("Last attempt: {e}")),
+                        spinner: false,
+                        error: false,
+                        buttons: vec![NoticeButton::ReconnectNow, NoticeButton::StopRetry],
+                    }
+                }
+                None => Notice {
+                    title: "Reconnecting…".into(),
+                    detail: self.status.clone(),
+                    note: None,
+                    spinner: true,
+                    error: false,
+                    buttons: vec![NoticeButton::StopRetry],
+                },
+            });
+        }
+        if let Phase::Failed(m) = &self.phase {
+            if m.is_empty() {
+                return None;
+            }
+            let mut buttons = vec![NoticeButton::TryAgain];
+            if self.in_use_retry {
+                buttons.push(NoticeButton::AskShare);
+            }
+            return Some(Notice { title: "Disconnected".into(), detail: m.clone(), note: None, spinner: false, error: true, buttons });
+        }
+        if self.stale {
+            return Some(Notice { title: "Reconnecting…".into(), detail: self.status.clone(), note: None, spinner: true, error: false, buttons: vec![] });
+        }
+        None
+    }
+
+    /// A centred box with the notice, on top of the screen area.
+    fn notice_panel(&mut self, ui: &egui::Ui, rect: egui::Rect, n: Notice) {
+        let mut clicked = None;
+        egui::Area::new(egui::Id::unique("connection-notice"))
+            .order(egui::Order::Middle)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .fixed_pos(rect.center())
+            .constrain_to(rect)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(16.0).show(ui, |ui| {
+                    ui.set_min_width(340.0);
+                    ui.set_max_width(460.0);
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            if n.spinner {
+                                ui.spinner();
+                            }
+                            ui.heading(&n.title);
+                        });
+                        if !n.detail.is_empty() {
+                            ui.add_space(4.0);
+                            let text = egui::RichText::new(&n.detail);
+                            ui.label(if n.error { text.color(ui.visuals().error_fg_color) } else { text });
                         }
-                        if self.in_use_retry && ui.button("Ask the current user to share").clicked() {
-                            self.reconnect(true);
+                        if let Some(e) = &n.note {
+                            ui.add_space(2.0);
+                            ui.weak(e);
+                        }
+                        if !n.buttons.is_empty() {
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                for b in &n.buttons {
+                                    let label = match b {
+                                        NoticeButton::ReconnectNow => "Reconnect now",
+                                        NoticeButton::StopRetry => "Stop",
+                                        NoticeButton::TryAgain => "Reconnect",
+                                        NoticeButton::AskShare => "Ask the current user to share",
+                                    };
+                                    if ui.button(label).clicked() {
+                                        clicked = Some(*b);
+                                    }
+                                }
+                            });
                         }
                     });
                 });
+            });
+        match clicked {
+            Some(NoticeButton::ReconnectNow | NoticeButton::TryAgain) => self.reconnect(false),
+            Some(NoticeButton::AskShare) => self.reconnect(true),
+            Some(NoticeButton::StopRetry) => {
+                self.retry = None;
+                if !matches!(self.phase, Phase::Failed(_)) {
+                    // Let the attempt that is under way finish on its own.
+                    self.stale = false;
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn video(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_size();
+        let notice = self.connection_notice();
+        let Some(tex) = &self.texture else {
+            if let Some(n) = notice {
+                self.notice_panel(ui, ui.max_rect(), n);
                 return;
             }
             // No picture yet (connecting, no signal, out of range, screen
@@ -692,16 +921,23 @@ impl ConsoleWindow {
         };
         let sized = egui::load::SizedTexture::new(tex.id(), size);
         let image = egui::Image::new(sized).sense(egui::Sense::click_and_drag());
+        let full = ui.max_rect();
         let resp = if self.fit {
             ui.centered_and_justified(|ui| ui.add(image)).inner
         } else {
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| ui.add(image)).inner
         };
         self.hovering_video = resp.hovered() || resp.dragged();
+        if let Some(n) = notice {
+            // Dim the last picture while there is no live session.
+            ui.painter().rect_filled(resp.rect.intersect(full), 0.0, egui::Color32::from_black_alpha(160));
+            self.notice_panel(ui, full, n);
+            return;
+        }
         if self.can_input() {
             self.pointer_input(ui, &resp, tw, th);
         }
-        if let (Some(VideoState::NoSignal | VideoState::OutOfRange), Some(_)) = (self.video_state, &self.texture) {
+        if let Some(VideoState::NoSignal | VideoState::OutOfRange) = self.video_state {
             let text = if self.video_state == Some(VideoState::NoSignal) { "No signal" } else { "Out of range" };
             ui.painter().text(resp.rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(24.0), egui::Color32::YELLOW);
         }
@@ -970,6 +1206,7 @@ impl WindowUi for ConsoleWindow {
     fn ui(&mut self, root: &mut egui::Ui, window: &Window, shell: &mut Shell) {
         let ctx = root.ctx().clone();
         self.poll();
+        self.drive_retry(&ctx);
         if self.session().is_none() && self.grabbed {
             self.want_grab = Some(false);
         }
@@ -1129,7 +1366,10 @@ impl Drop for ConsoleWindow {
         // the app exits, leaving the session open on the iDRAC, which only
         // allows a few at a time.
         if let Some(w) = self.web.take() {
-            w.logout();
+            let _ = w.logout();
+        }
+        for w in std::mem::take(&mut *self.old_webs.lock().unwrap()) {
+            let _ = w.logout();
         }
     }
 }

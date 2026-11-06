@@ -94,6 +94,10 @@ slow.
   shows frame rate and bandwidth.
 - If the server's screen is asleep ("No signal" / "Out of range"), point at
   the black area and press a key or click to wake it.
+- If the connection drops (network trouble, the iDRAC rebooting or an
+  idle timeout), the console reconnects by itself, waiting a little longer
+  after each failed try. Turn this off under **Tools → Reconnect
+  automatically**.
 - If someone else is using the console, you can ask them to share it. If
   you are the one using it and someone asks, you can allow, allow view
   only, or reject.
