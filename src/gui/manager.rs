@@ -108,6 +108,9 @@ impl ManagerWindow {
                 ui.label("");
                 ui.checkbox(&mut inst.save_password, "Save password (stored in plain text)");
                 ui.end_row();
+                ui.label("Console");
+                ui.checkbox(&mut inst.view_only, "Open in view-only mode (no keyboard or mouse)");
+                ui.end_row();
                 ui.label("Web proxy port");
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut inst.proxy_port).range(0..=65535));

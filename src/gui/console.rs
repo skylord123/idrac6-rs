@@ -37,7 +37,10 @@ pub struct ConsoleWindow {
     window_id: Option<WindowId>,
     proxy: Option<EventLoopProxy<UserEvent>>,
     status: String,
+    /// The iDRAC made this a view-only session.
     view_only: bool,
+    /// The user turned input off (View → View only).
+    user_view_only: bool,
     resolution: Option<(u16, u16)>,
     leds: proto::Leds,
     video_state: Option<VideoState>,
@@ -111,13 +114,13 @@ impl ConsoleWindow {
     pub fn new(inst: Instance) -> Self {
         Self {
             phase: Phase::Failed(String::new()),
-            inst,
             web: None,
             info: None,
             window_id: None,
             proxy: None,
             status: "Starting…".into(),
             view_only: false,
+            user_view_only: inst.view_only,
             resolution: None,
             leds: Default::default(),
             video_state: None,
@@ -149,6 +152,7 @@ impl ConsoleWindow {
             show_stats: false,
             stats: Stats::default(),
             vm: VmPanel::new(),
+            inst,
             type_text: None,
             type_speed: Speed::Normal,
             typing: None,
@@ -207,7 +211,24 @@ impl ConsoleWindow {
     }
 
     fn can_input(&self) -> bool {
-        self.session().is_some() && !self.view_only
+        self.session().is_some() && !self.view_only && !self.user_view_only
+    }
+
+    fn set_user_view_only(&mut self, on: bool) {
+        if on {
+            self.release_all_keys();
+            if let Some(job) = self.typing.take() {
+                job.cancel();
+            }
+            self.want_grab = Some(false);
+            if self.mouse_buttons != 0 {
+                self.mouse_buttons = 0;
+                if let (Some(s), Some((x, y))) = (self.session(), self.mouse) {
+                    s.mouse(x, y, 0, 0);
+                }
+            }
+        }
+        self.user_view_only = on;
     }
 
     fn release_all_keys(&mut self) {
@@ -425,6 +446,15 @@ impl ConsoleWindow {
                     }
                 }
                 ui.separator();
+                let mut vo = self.user_view_only;
+                if ui
+                    .checkbox(&mut vo, "View only")
+                    .on_hover_text("Watch without sending any keyboard or mouse input to the server")
+                    .clicked()
+                {
+                    self.set_user_view_only(vo);
+                }
+                ui.separator();
                 ui.radio_value(&mut self.fit, true, "Fit to window");
                 ui.radio_value(&mut self.fit, false, "Actual size (1:1)");
                 ui.separator();
@@ -544,7 +574,14 @@ impl ConsoleWindow {
                 led(ui, "Caps", self.leds.caps);
                 led(ui, "Num", self.leds.num);
                 if self.view_only {
-                    ui.colored_label(ui.visuals().warn_fg_color, "View only");
+                    ui.colored_label(ui.visuals().warn_fg_color, "View only (set by the iDRAC)");
+                } else if self.user_view_only {
+                    let r = ui
+                        .add(egui::Button::new(egui::RichText::new("View only").color(ui.visuals().warn_fg_color)).small())
+                        .on_hover_text("Keyboard and mouse input is off. Click to turn it back on.");
+                    if r.clicked() {
+                        self.set_user_view_only(false);
+                    }
                 }
             });
         });
@@ -951,6 +988,9 @@ impl WindowUi for ConsoleWindow {
                 if self.grabbed {
                     ui.separator();
                     ui.strong("Single cursor: press F9 to release the pointer");
+                } else if self.session().is_some() && (self.user_view_only || self.view_only) {
+                    ui.separator();
+                    ui.weak("View only: keyboard and mouse are not sent");
                 } else if self.can_input() && self.capture_keys {
                     ui.separator();
                     ui.weak(if self.hovering_video { "Keyboard goes to the server" } else { "Point at the screen to type" });

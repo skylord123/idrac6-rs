@@ -80,6 +80,9 @@ slow.
 - **Power** has On, Off, Reset, Power Cycle and Graceful Shutdown. Each
   one asks for confirmation.
 - **View** switches between fit-to-window and 1:1, and has full screen.
+  **View → View only** stops all keyboard and mouse input, for watching a
+  server without the risk of a stray key press. Tick *Open in view-only
+  mode* in an iDRAC's settings to make that the default.
 - **File → Save screenshot** saves a PNG.
 - **Tools → Mouse acceleration** should match the server's OS (Windows or
   Linux). A mismatch makes the server's pointer drift away from yours.

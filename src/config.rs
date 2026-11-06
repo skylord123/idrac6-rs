@@ -20,6 +20,8 @@ pub struct Instance {
     pub save_password: bool,
     /// Fixed local port for the web UI proxy. 0 picks a free port.
     pub proxy_port: u16,
+    /// Open consoles with keyboard and mouse input turned off.
+    pub view_only: bool,
 }
 
 impl Default for Instance {
@@ -32,6 +34,7 @@ impl Default for Instance {
             password: String::new(),
             save_password: true,
             proxy_port: 0,
+            view_only: false,
         }
     }
 }
