@@ -254,9 +254,40 @@ and the saved password. The iDRAC's host key is kept in
 `ssh_known_hosts` in the settings directory. Logging in takes about 10
 seconds.
 
-The serial console shows something only if the server's OS (or BIOS
-console redirection) uses the serial port, and the iDRAC's serial over
-LAN is enabled.
+The serial console only shows what the server sends to its serial port,
+so a blank screen usually means the server isn't using it. Three things
+need to be set up:
+
+1. **iDRAC**: serial over LAN on (the default). Check with `racadm
+   getconfig -g cfgIpmiSol` (`cfgIpmiSolEnable=1`) and `racadm getconfig
+   -g cfgSerial` (`cfgSerialCom2RedirEnable=1`). Note the baud rate,
+   usually 115200.
+2. **BIOS** (F2 at boot → Serial Communication): *Serial Communication*
+   "On with Console Redirection via COM2", *External Serial Connector*
+   "Serial Device1", *Failsafe Baud Rate* 115200, *Remote Terminal Type*
+   VT100/VT220, *Redirection After Boot* enabled. The BIOS screens and
+   boot menu then also appear on the serial console.
+3. **The OS**: a login prompt (getty) on the COM2 port, which Linux calls
+   `ttyS1`, at the same baud rate. To also see boot messages, add
+   `console=tty0 console=ttyS1,115200n8` to the kernel command line.
+
+On **Unraid**, add the login prompt by appending these lines to
+`/boot/config/go` (Unraid rebuilds `/etc` on every boot), and run them
+once to start it right away:
+
+```sh
+grep -q ttyS1 /etc/inittab || echo 's1:12345:respawn:/sbin/agetty -L 115200 ttyS1 vt100' >> /etc/inittab
+grep -qx ttyS1 /etc/securetty 2>/dev/null || echo ttyS1 >> /etc/securetty
+telinit q
+```
+
+For boot messages, add `console=tty0 console=ttyS1,115200n8` to the
+`append` line under *Unraid OS* in Main → Flash → Syslinux Configuration,
+and reboot.
+
+To check which port is COM2, open the serial console and run
+`echo hello > /dev/ttyS1` on the server; if nothing appears, try
+`/dev/ttyS0`.
 
 It needs OpenSSH's `ssh`: on Linux the `openssh-client` package, on
 Windows the built-in "OpenSSH Client" optional feature. On Linux the

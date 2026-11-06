@@ -133,7 +133,11 @@ pub fn run(inst: &Instance, mode: Mode, wait_on_error: bool) -> Result<i32> {
     println!("Connecting to {} ({}). The iDRAC takes about 10 seconds to log in.", inst.title(), inst.host);
     match mode {
         Mode::Shell => println!("Type help for the iDRAC's commands, exit to leave.\n"),
-        Mode::Serial => println!("Serial console (COM2). Press Ctrl+\\ to end it.\n"),
+        Mode::Serial => {
+            println!("Serial console (COM2). Press Ctrl+\\ to end it.");
+            println!("Blank? Press Enter for a login prompt. If still nothing shows, the server's OS isn't using its");
+            println!("serial port: it needs a getty on the COM2 port (usually ttyS1) at 115200 baud. See the README.\n");
+        }
     }
     let status = cmd.status().context("running ssh")?;
     let code = status.code().unwrap_or(1);
@@ -199,7 +203,7 @@ pub fn open_terminal(inst: &Instance, mode: Mode, _custom: &str) -> Result<()> {
     let title: String = title(inst, mode).chars().filter(|c| c.is_alphanumeric() || " .:-_".contains(*c)).collect();
     let note = match mode {
         Mode::Shell => "Connecting. The iDRAC takes about 10 seconds to log in.",
-        Mode::Serial => "Connecting to the serial console (COM2). Press Ctrl+\\ to end it.",
+        Mode::Serial => "Connecting to the serial console (COM2). Press Ctrl+\\ to end it. Blank? Press Enter; the server's OS must run a login prompt on its COM2 port (usually ttyS1) at 115200 baud.",
     };
     let mut cmd = Command::new("cmd.exe");
     cmd.raw_arg(format!("/c \"title {title} & echo {note} & {line} || pause\""));
