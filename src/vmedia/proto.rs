@@ -451,14 +451,16 @@ pub fn disconnect_reason_text(reason: u8) -> &'static str {
 
 /// Device status codes from DEVICE_STATUS. `None` means "not an error".
 pub fn device_status_error(status: i32) -> Option<&'static str> {
+    // Like the Java client: only these codes are errors; 0 (seen right after
+    // a successful map), 1, 3, 7 and anything unlisted are informational.
     match status {
-        1 | 3 | 7 => None,
         2 => Some("read failed"),
         4 => Some("mapping failed: the virtual USB device is not connected"),
         5 => Some("mapping failed: the drive is already attached"),
         6 => Some("drive released by the iDRAC"),
         8 => Some("mapping failed"),
-        _ => Some("unknown device error"),
+        -1 => Some("unknown device error"),
+        _ => None,
     }
 }
 
