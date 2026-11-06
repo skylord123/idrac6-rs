@@ -5,6 +5,7 @@ servers (PowerEdge R610, R710, T610 and friends), without Java.
 
 - **Virtual console**: see the server's screen, use keyboard and mouse,
   send Ctrl-Alt-Del and other macros, power control, screenshots.
+- **Boot captures**: replay the iDRAC's recordings of the last boots.
 - **Virtual Media**: attach an ISO or disk image from your computer to the
   server as a USB CD/DVD or disk.
 - **Web UI proxy**: open the iDRAC web interface in a modern browser. The
@@ -76,7 +77,15 @@ slow.
   one asks for confirmation.
 - **View** switches between fit-to-window and 1:1, and has full screen.
 - **File → Save screenshot** saves a PNG.
-- **Video → Bandwidth limit** helps on slow links.
+- **Tools → Mouse acceleration** should match the server's OS (Windows or
+  Linux). A mismatch makes the server's pointer drift away from yours.
+- **Tools → Single cursor** hides your pointer and moves the server's pointer
+  directly, so there is only one pointer to follow. Click the screen to
+  start; press **F9** to get your pointer back.
+- **Tools → Bandwidth limit** helps on slow links; **Tools → Statistics**
+  shows frame rate and bandwidth.
+- If the server's screen is asleep ("No signal" / "Out of range"), point at
+  the black area and press a key or click to wake it.
 - If someone else is using the console, you can ask them to share it. If
   you are the one using it and someone asks, you can allow, allow view
   only, or reject.
@@ -91,6 +100,13 @@ Media**, then **Map image…** next to *Virtual CD/DVD* (an `.iso`) or
 *Virtual floppy / disk* (an `.img`). The server sees a USB drive it can
 boot from (choose it in the boot menu with F11). Keep the console window
 open while the image is in use.
+
+### Boot captures
+
+iDRAC6 records the server's screen during its last three boots. Click
+**Boot captures** to replay them, with play, pause, step, rewind, a seek
+bar and playback speed. Handy for seeing a BIOS error or kernel panic that
+scrolled past. From the command line: `idrac6 captures "R710 lab"`.
 
 ### Web interface
 
@@ -147,7 +163,8 @@ The iDRAC6 Java viewer was decompiled and its protocols re-implemented. The
 docs describe the formats:
 
 - [docs/protocol.md](docs/protocol.md): console protocol (APCP, AVSP, input, power)
-- [docs/video-codec.md](docs/video-codec.md): the ASPEED AST2050 video codec
+- [docs/video-dvc.md](docs/video-dvc.md): the Avocent DVC video codec iDRAC6 uses, and the boot capture file format
+- [docs/video-codec.md](docs/video-codec.md): the ASPEED video codec (supported, but not used by iDRAC6)
 - [docs/virtual-media.md](docs/virtual-media.md): Virtual Media protocol
 - [docs/reverse-engineering.md](docs/reverse-engineering.md): how this was done and how to reproduce it
 
@@ -158,6 +175,8 @@ src/
   main.rs        command line
   gui/           windows (winit + egui): manager, console, virtual media
   kvm/           console protocol: messages, session, keyboard map
+  video/dvc.rs   DVC video decoder (what iDRAC6 sends)
+  video/playback.rs  boot capture recordings
   video/aspeed.rs  ASPEED video decoder
   vmedia/        Virtual Media protocol and image serving
   web.rs         iDRAC web login and viewer.jnlp
@@ -167,15 +186,16 @@ src/
 
 ## Status
 
-New and still being tested. The web proxy has been tested against an
-iDRAC6 on a PowerEdge R710. The video decoder matches the original Java
-decoder pixel for pixel. The console and Virtual Media were built from the
+New and still being tested. Tested on an iDRAC6 in a PowerEdge R710: web
+proxy, console video, keyboard, and boot capture playback. The video and
+playback decoders match the original Java viewer pixel for pixel on real
+recordings. Virtual Media and single cursor mode were built from the
 reverse-engineered protocol and need more real-world testing. Bug reports
-with a `RUST_LOG=debug` log are very welcome.
+with a `RUST_LOG=debug` log are very welcome (set `IDRAC6_CAPTURE=<file>`
+to also record the video stream).
 
 Not supported: iDRAC7 and newer (they use different, HTML5 consoles),
-physical CD drives and smart cards for Virtual Media, and the older Avocent
-DVC video codec that iDRAC6 does not use.
+and physical CD drives and smart cards for Virtual Media.
 
 ## License
 

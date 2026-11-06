@@ -17,6 +17,7 @@ idrac6 - virtual console and web UI proxy for Dell iDRAC6
 USAGE:
     idrac6                      Open the console manager (GUI)
     idrac6 console <name|host> Open the console of a saved iDRAC directly
+    idrac6 captures <name|host> Replay the boot recordings of a saved iDRAC
     idrac6 proxy <host> [--port <local-port>] [--https-port <port>]
                                 Run only the web UI proxy, without a GUI
     idrac6 --help | --version
@@ -40,8 +41,8 @@ fn main() {
             Ok(())
         }
         Some("proxy") => run_proxy(&args[1..]),
-        Some("console") => {
-            let want = args.get(1).ok_or_else(|| anyhow::anyhow!("usage: idrac6 console <name|host>"));
+        Some(cmd @ ("console" | "captures")) => {
+            let want = args.get(1).ok_or_else(|| anyhow::anyhow!("usage: idrac6 {cmd} <name|host>"));
             want.and_then(|want| {
                 let cfg = config::Config::load();
                 let inst = cfg
@@ -52,7 +53,11 @@ fn main() {
                 if inst.password.is_empty() {
                     anyhow::bail!("'{want}' has no saved password; open it from the manager instead");
                 }
-                gui::run(Box::new(gui::ConsoleWindow::new(inst)))
+                if cmd == "console" {
+                    gui::run(Box::new(gui::ConsoleWindow::new(inst)))
+                } else {
+                    gui::run(Box::new(gui::PlaybackWindow::new(inst)))
+                }
             })
         }
         Some(other) => Err(anyhow::anyhow!("unknown command '{other}'\n\n{USAGE}")),

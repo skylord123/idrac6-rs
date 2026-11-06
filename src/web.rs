@@ -187,11 +187,49 @@ impl WebSession {
         ConsoleInfo::from_jnlp(&r.text())
     }
 
+    /// The boot recordings the iDRAC keeps (up to three, newest first).
+    pub fn boot_captures(&self) -> Result<Vec<BootCapture>> {
+        let r = self.get("/data?get=bootCapFileData")?;
+        if r.status != 200 {
+            bail!("listing boot captures returned HTTP {}", r.status);
+        }
+        let xml = r.text();
+        if xml_value(&xml, "bootCapEnabled") == Some("0") {
+            bail!("Boot capture is disabled on this iDRAC.");
+        }
+        let count: usize = xml_value(&xml, "bootCapCount").and_then(|v| v.parse().ok()).unwrap_or(0);
+        Ok((0..count.min(3))
+            .filter_map(|i| {
+                let file = xml_value(&xml, &format!("bootCapFname{i}"))?.to_string();
+                let date = xml_value(&xml, &format!("bootCapDate{i}")).unwrap_or("").to_string();
+                (!file.is_empty() && !file.contains(' ')).then_some(BootCapture { file, date })
+            })
+            .collect())
+    }
+
+    /// Download one boot recording (at most 2 MiB).
+    pub fn download_boot_capture(&self, c: &BootCapture) -> Result<Vec<u8>> {
+        let r = self.get(&format!("/captures/{}", c.file))?;
+        if r.status != 200 {
+            bail!("downloading {} returned HTTP {}", c.file, r.status);
+        }
+        Ok(r.body)
+    }
+
     pub fn logout(&self) {
         if let Err(e) = self.get("/data/logout") {
             log::debug!("logout failed: {e:#}");
         }
     }
+}
+
+/// A boot recording stored on the iDRAC.
+#[derive(Debug, Clone)]
+pub struct BootCapture {
+    /// File name under `/captures/`, e.g. `bootcapture_2`.
+    pub file: String,
+    /// When it was recorded, as the iDRAC formats it.
+    pub date: String,
 }
 
 /// The arguments the Java viewer would have been started with.
@@ -275,6 +313,14 @@ mod tests {
         // DNS name or a forwarded address), not the IP inside the JNLP.
         assert_eq!(p.host, "idrac.local");
         assert!(c.vm_privilege());
+    }
+
+    #[test]
+    fn xml_values() {
+        let x = "<root><bootCapCount>2</bootCapCount><bootCapFname0>bootcapture_2</bootCapFname0></root>";
+        assert_eq!(xml_value(x, "bootCapCount"), Some("2"));
+        assert_eq!(xml_value(x, "bootCapFname0"), Some("bootcapture_2"));
+        assert_eq!(xml_value(x, "missing"), None);
     }
 
     #[test]

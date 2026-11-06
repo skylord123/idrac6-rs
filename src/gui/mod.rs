@@ -6,6 +6,7 @@
 
 mod console;
 mod manager;
+mod playback;
 mod vmedia;
 
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 pub use console::ConsoleWindow;
 pub use manager::ManagerWindow;
+pub use playback::PlaybackWindow;
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use winit::dpi::LogicalSize;
 use winit::window::{Window, WindowAttributes};
 
+use super::playback::PlaybackWindow;
 use super::{ConsoleWindow, Shell, WindowUi};
 use crate::config::{Config, Instance};
 use crate::proxy::WebProxy;
@@ -16,9 +17,16 @@ pub struct ManagerWindow {
     proxies: HashMap<usize, Arc<WebProxy>>,
     editing: Option<(Option<usize>, Instance)>,
     confirm_delete: Option<usize>,
-    /// Password prompt for instances without a saved password.
-    prompt: Option<(usize, String)>,
+    /// Password prompt for instances without a saved password: which
+    /// instance, what to open afterwards, and the typed password.
+    prompt: Option<(usize, Open, String)>,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum Open {
+    Console,
+    BootCaptures,
 }
 
 impl ManagerWindow {
@@ -39,10 +47,22 @@ impl ManagerWindow {
         }
     }
 
-    fn open_console(&mut self, idx: usize, password: String, shell: &mut Shell) {
+    fn open(&mut self, idx: usize, what: Open, password: String, shell: &mut Shell) {
         let mut inst = self.config.instances[idx].clone();
         inst.password = password;
-        shell.open.push(Box::new(ConsoleWindow::new(inst)));
+        match what {
+            Open::Console => shell.open.push(Box::new(ConsoleWindow::new(inst))),
+            Open::BootCaptures => shell.open.push(Box::new(PlaybackWindow::new(inst))),
+        }
+    }
+
+    fn open_or_prompt(&mut self, idx: usize, what: Open, shell: &mut Shell) {
+        let pw = self.config.instances[idx].password.clone();
+        if pw.is_empty() {
+            self.prompt = Some((idx, what, String::new()));
+        } else {
+            self.open(idx, what, pw, shell);
+        }
     }
 
     fn toggle_proxy(&mut self, idx: usize) {
@@ -190,6 +210,9 @@ impl WindowUi for ManagerWindow {
                             if ui.button(label).on_hover_text("Open the iDRAC web interface through a local TLS proxy").clicked() {
                                 action = Some((i, "proxy"));
                             }
+                            if ui.button("Boot captures").on_hover_text("Replay the server's last boot cycles recorded by the iDRAC").clicked() {
+                                action = Some((i, "captures"));
+                            }
                             if let Some(p) = self.proxies.get(&i) {
                                 let url = p.url();
                                 ui.hyperlink_to(&url, &url);
@@ -212,15 +235,8 @@ impl WindowUi for ManagerWindow {
                 });
             });
             match action {
-                Some((i, "console")) => {
-                    let inst = &self.config.instances[i];
-                    if inst.password.is_empty() {
-                        self.prompt = Some((i, String::new()));
-                    } else {
-                        let pw = inst.password.clone();
-                        self.open_console(i, pw, shell);
-                    }
-                }
+                Some((i, "console")) => self.open_or_prompt(i, Open::Console, shell),
+                Some((i, "captures")) => self.open_or_prompt(i, Open::BootCaptures, shell),
                 Some((i, "proxy")) => self.toggle_proxy(i),
                 Some((i, "edit")) => self.editing = Some((Some(i), self.config.instances[i].clone())),
                 Some((i, "remove")) => self.confirm_delete = Some(i),
@@ -251,7 +267,7 @@ impl WindowUi for ManagerWindow {
             }
         }
 
-        if let Some((i, mut pw)) = self.prompt.take() {
+        if let Some((i, what, mut pw)) = self.prompt.take() {
             let mut keep = true;
             let mut go = false;
             egui::Modal::new(egui::Id::unique("pw")).show(&ctx, |ui| {
@@ -271,9 +287,9 @@ impl WindowUi for ManagerWindow {
                 });
             });
             if go {
-                self.open_console(i, pw, shell);
+                self.open(i, what, pw, shell);
             } else if keep {
-                self.prompt = Some((i, pw));
+                self.prompt = Some((i, what, pw));
             }
         }
     }

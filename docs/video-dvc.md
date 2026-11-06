@@ -109,3 +109,63 @@ A capture of 96 Video Packets from a live iDRAC6 (an Unraid text console,
 1280×1024) was decoded by the original Java `d.c` decoder, driven exactly
 like `kvm/b/q.f()` drives it, and by the Rust port. All 79 completed
 frames have identical RGB contents.
+
+## Boot capture recordings
+
+iDRAC6 records the console during the last three server boots ("Boot
+Capture", web UI page `lastboot.html`). The recordings use the same DVC
+codec. `src/video/playback.rs` parses and plays them.
+
+### Web endpoints
+
+| Request | Result |
+|---|---|
+| `GET /data?get=bootCapFileData` | XML: `bootCapEnabled`, `bootCapCount`, `bootCapFname0..2` (e.g. `bootcapture_2`, or `No Recording Available`), `bootCapDate0..2`, `bootSortDate0..2` (Unix time). Index 0 is the latest. |
+| `GET /data?type=jnlp&get=captureFile(<idx>@<ip>@<ipv6fmt>@ @<millis>)` | JNLP for `com.avocent.idrac.kvm.Main` with `url=https://<ip>:443/captures/<fname>`, `user`, `passwd`, `maxFileLength=2097152`, `title`. |
+| `GET /captures/<fname>` | The recording itself, at most 2 MiB. It needs neither a session cookie nor the JNLP tokens. |
+
+The viewer maps the JNLP argument `url` to its `dvcurl` property, which
+switches it to playback mode. The file is fetched with a plain HTTP GET
+(the `user`/`passwd` tokens are unused), and at most `length` bytes
+(default 2 MiB) are read.
+
+### File format
+
+A sequence of records, big endian, read from offset 0 (it is not a ring
+buffer):
+
+```text
+len32                  total record length including these 4 bytes, >= 20
+"DE AD BE EF"
+timestamp32            milliseconds since recording start
+width16  height16
+flags8                 bit 0 begin of frame, bit 1 end of frame, bit 2 unknown (ignored)
+x8 x8 x8
+data[len - 20]         DVC opcode stream, same as a Video Packet after its 12 byte sub-header
+```
+
+The reader (`com.avocent.kvm.d.a.a.q`, mode 3) stops at a record shorter
+than 20 bytes or one that runs past the end of the file. Files are usually
+filled up to exactly 2 MiB. In practice every record has both begin and
+end set, so each record is one complete screen update. The text-mode boot
+screens report 752×413, and the size changes when the OS switches mode.
+Records are decoded by the 15 bit colour decoder (`d.c`, i.e. as type
+`0x81`), with no checksum.
+
+### Timing and controls
+
+`com.avocent.kvm.d.a.b` sleeps `timestamp - previous timestamp` before
+each record, capped at 1000 ms, so long idle periods in a recording play
+back in one second. A 460 s recording plays in about 370 s.
+
+| Control | Java behaviour |
+|---|---|
+| Play | Decode continuously at the recorded pace. |
+| Pause | Stop decoding. |
+| Step | While paused, decode up to the next completed frame. |
+| Rewind | Reset decoder and screen to black and restart from the first record, paused. |
+| Replay | Rewind, then play. |
+| Frame: | Counter of completed frames since the last rewind. |
+
+`playback::Player` provides the same operations (`advance_to`, `step`,
+`rewind`, `frames_shown`) and leaves the clock to the caller.

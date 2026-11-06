@@ -2,6 +2,7 @@
 
 pub mod aspeed;
 pub mod dvc;
+pub mod playback;
 
 /// Decoded screen contents. Pixels are 0x00RRGGBB, row-major.
 #[derive(Clone, Default)]
