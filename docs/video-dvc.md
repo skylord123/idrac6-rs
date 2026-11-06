@@ -160,6 +160,13 @@ height and begin/end flags and the time since recording started. They can
 be longer than 2 MiB; the player reads the whole file. Packets of other
 types are not recorded (iDRAC6 only sends `0x81`).
 
+A recording starts at the first packet that begins an update. Before it,
+the writer stores the live screen as it is at that moment, encoded as one
+frame of pixel, copy-left and copy-above opcodes (`dvc::encode_frame`,
+split into ~8 KB records), so the recording does not have to wait for a
+full refresh from the server, which iDRAC6 takes several seconds to send
+and during which the console does not update.
+
 ### MP4 export
 
 `video::mp4` decodes a recording with the normal decoder and pipes the

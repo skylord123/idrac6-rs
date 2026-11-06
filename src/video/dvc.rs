@@ -113,6 +113,49 @@ fn rgb15(v: u32) -> u32 {
     BLACK | r << 16 | g << 8 | b
 }
 
+/// Encode a whole picture (`fb`, as the decoder exports it) as 15 bit DVC
+/// opcodes, split into packet bodies of at most `max` bytes at opcode
+/// boundaries. Fed as one frame (begin on the first, end on the last), it
+/// draws the same picture. Used to start a recording with the screen as it
+/// is, without asking the server for a full refresh.
+pub fn encode_frame(fb: &Framebuffer, max: usize) -> Vec<Vec<u8>> {
+    let px = &fb.pixels[..(fb.width * fb.height).min(fb.pixels.len())];
+    let w = fb.width;
+    let mut out = vec![Vec::new()];
+    let mut emit = |op: &[u8]| {
+        if out.last().unwrap().len() + op.len() > max {
+            out.push(Vec::new());
+        }
+        out.last_mut().unwrap().extend_from_slice(op);
+    };
+    let mut i = 0;
+    while i < px.len() {
+        let run = |from: usize| px[i..].iter().zip(&px[from..]).take_while(|(a, b)| a == b).count();
+        let left = if i > 0 { run(i - 1) } else { 0 };
+        let above = if i >= w { run(i - w) } else { 0 };
+        if left == 0 && above == 0 {
+            let c = px[i];
+            let v = (c >> 9 & 0x7C00) | (c >> 6 & 0x3E0) | (c >> 3 & 0x1F);
+            emit(&[0x80 | (v >> 8) as u8, v as u8]);
+            i += 1;
+            continue;
+        }
+        let (class, n) = if above >= left { (0x40, above) } else { (0x20, left) };
+        // Runs are never longer than a screen (2^25 pixels max), and two
+        // runs of the same kind never follow each other, so the
+        // continuation bytes are unambiguous.
+        let mut op = vec![class | (n & 0x1F) as u8];
+        let mut rest = n >> 5;
+        while rest > 0 {
+            op.push(class | (rest & 0x1F) as u8);
+            rest >>= 5;
+        }
+        emit(&op);
+        i += n;
+    }
+    out
+}
+
 struct Packet {
     kind: Kind,
     hdr: DvcHeader,
@@ -631,6 +674,30 @@ mod tests {
         let data = [0xFF, 0xFF, 0x23, 0x00, 0x44];
         d.push_packet(0x81, &packet(4, 2, true, true, &data), &mut fb).unwrap();
         assert!(fb.pixels.iter().take(7).all(|&p| p == 0xF8F8F8));
+    }
+
+    #[test]
+    fn encode_frame_round_trips() {
+        let (w, h) = (37usize, 23usize);
+        let mut fb = Framebuffer::default();
+        fb.resize(w, h);
+        for (i, p) in fb.pixels.iter_mut().enumerate() {
+            let (x, y) = (i % w, i / w);
+            // Flat areas, repeated rows and noise.
+            let c: u32 = if y < 5 { 0x102030 } else if y % 3 == 0 { (x as u32 * 77) ^ 0x5a5a5a } else if x > 30 { 0xF8F8F8 } else { (i as u32).wrapping_mul(2654435761) };
+            *p = c & 0xF8F8F8;
+        }
+        // Small packets to cross opcode boundaries; start from a different
+        // picture so nothing is left over.
+        let mut d = DvcDecoder::new();
+        let mut out = Framebuffer::default();
+        d.push_packet(0x81, &packet(w as u16, h as u16, true, true, &[0xFF, 0xFF, 0x3F, 0x3F, 0x21]), &mut out).unwrap();
+        let parts = encode_frame(&fb, 16);
+        assert!(parts.len() > 1 && parts.iter().all(|p| !p.is_empty() && p.len() <= 16));
+        for (k, p) in parts.iter().enumerate() {
+            d.push_packet(0x81, &packet(w as u16, h as u16, k == 0, k == parts.len() - 1, p), &mut out).unwrap();
+        }
+        assert_eq!(out.pixels, fb.pixels);
     }
 
     #[test]

@@ -34,6 +34,10 @@ pub const MAX_FILE_LEN: usize = 2 * 1024 * 1024;
 /// the 15 bit colour decoder (`com.avocent.kvm.d.c`).
 pub const MSG_TYPE: u8 = 0x81;
 
+/// Body size of the packets the starting picture is split into, about
+/// what the iDRAC6 sends.
+const KEYFRAME_PACKET: usize = 8000;
+
 const MAGIC: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
 
 /// One recorded video packet.
@@ -167,17 +171,22 @@ pub struct Writer {
     pub skipped: u64,
     /// Writing failed (disk full, ...); nothing more is recorded.
     pub error: Option<String>,
+    /// The first update has started: the picture it builds on was written.
+    synced: bool,
 }
 
 impl Writer {
     pub fn create(path: &Path) -> Result<Writer> {
         let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-        Ok(Writer { out: std::io::BufWriter::new(f), path: path.to_path_buf(), start: Instant::now(), bytes: 0, skipped: 0, error: None })
+        Ok(Writer { out: std::io::BufWriter::new(f), path: path.to_path_buf(), start: Instant::now(), bytes: 0, skipped: 0, error: None, synced: false })
     }
 
     /// Add one live Video Packet (message type and payload including the
-    /// 12 byte DVC sub-header).
-    pub fn packet(&mut self, msg_type: u8, payload: &[u8]) -> std::io::Result<()> {
+    /// 12 byte DVC sub-header). `screen` is the live picture before this
+    /// packet is decoded: the recording starts with it, so it does not
+    /// need a full refresh from the server (which the iDRAC6 takes
+    /// seconds to send).
+    pub fn packet(&mut self, msg_type: u8, payload: &[u8], screen: &Framebuffer) -> std::io::Result<()> {
         if self.error.is_some() {
             return Ok(());
         }
@@ -187,8 +196,27 @@ impl Writer {
         }
         let h = dvc::parse_header(payload);
         let ts = self.start.elapsed().as_millis().min(u32::MAX as u128) as u32;
-        let rec = encode_record(ts, h.width, h.height, h.begin, h.end, &payload[dvc::HEADER_LEN..]);
-        if let Err(e) = self.out.write_all(&rec) {
+        if !self.synced {
+            // The rest of an update that started before recording can't be
+            // used on its own; wait for the next one.
+            if !h.begin {
+                return Ok(());
+            }
+            self.synced = true;
+            // After a resolution change the server sends a full picture.
+            if (screen.width, screen.height) == (h.width as usize, h.height as usize) && screen.width > 0 {
+                let parts = dvc::encode_frame(screen, KEYFRAME_PACKET);
+                let last = parts.len() - 1;
+                for (i, part) in parts.iter().enumerate() {
+                    self.write(&encode_record(ts, h.width, h.height, i == 0, i == last, part))?;
+                }
+            }
+        }
+        self.write(&encode_record(ts, h.width, h.height, h.begin, h.end, &payload[dvc::HEADER_LEN..]))
+    }
+
+    fn write(&mut self, rec: &[u8]) -> std::io::Result<()> {
+        if let Err(e) = self.out.write_all(rec) {
             self.error = Some(e.to_string());
             return Err(e);
         }
@@ -306,8 +334,9 @@ mod tests {
         // A live packet: 12 byte sub-header (height, width, begin+end) + data.
         let mut live = vec![0, 0, 0, 0, 0, 2, 0, 8, 3, 0, 0, 0];
         live.extend_from_slice(&[0xFC, 0x00, 0x23]);
-        w.packet(MSG_TYPE, &live).unwrap();
-        w.packet(0x86, &live).unwrap();
+        let blank = Framebuffer::default();
+        w.packet(MSG_TYPE, &live, &blank).unwrap();
+        w.packet(0x86, &live, &blank).unwrap();
         let (_, _, bytes) = w.finish().unwrap();
         let data = std::fs::read(&path).unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -320,6 +349,39 @@ mod tests {
         DvcDecoder::new().push_packet(MSG_TYPE, &live, &mut a).unwrap();
         Player::new(r).step(&mut b).unwrap();
         assert_eq!(a.pixels, b.pixels);
+    }
+
+    #[test]
+    fn writer_starts_with_the_current_screen() {
+        let dir = std::env::temp_dir().join(format!("idrac6-rec-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.dvcrec");
+        let mut screen = Framebuffer::default();
+        screen.resize(8, 2);
+        screen.pixels.iter_mut().enumerate().for_each(|(i, p)| *p = if i % 3 == 0 { 0xF80000 } else { 0x0000F8 });
+        let mut w = Writer::create(&path).unwrap();
+        let live = |flags: u8, data: &[u8]| {
+            let mut p = vec![0, 0, 0, 0, 0, 2, 0, 8, flags, 0, 0, 0];
+            p.extend_from_slice(data);
+            p
+        };
+        // The end of an update that began before recording: dropped.
+        w.packet(MSG_TYPE, &live(2, &[0x05]), &screen).unwrap();
+        // The next update: skip 1 pixel, one white pixel.
+        w.packet(MSG_TYPE, &live(3, &[0x01, 0xFF, 0xFF]), &screen).unwrap();
+        w.finish().unwrap();
+        let data = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let r = parse(&data).unwrap();
+        assert_eq!(r.frames.len(), 2);
+        let mut fb = Framebuffer::default();
+        let mut p = Player::new(r);
+        p.step(&mut fb).unwrap();
+        assert_eq!(fb.pixels, screen.pixels);
+        p.step(&mut fb).unwrap();
+        let mut want = screen.pixels.clone();
+        want[1] = 0xF8F8F8;
+        assert_eq!(fb.pixels, want);
     }
 
     #[test]

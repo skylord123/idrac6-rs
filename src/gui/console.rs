@@ -624,10 +624,6 @@ impl ConsoleWindow {
             Ok(w) => {
                 *self.recorder.lock().unwrap() = Some(w);
                 self.rec_video = target;
-                // Start with a complete picture.
-                if let Some(s) = self.session() {
-                    s.refresh();
-                }
             }
             Err(e) => self.message = Some(format!("Could not start recording: {e:#}")),
         }

@@ -545,14 +545,16 @@ impl VideoAssembler {
             t @ (ty::VIDEO_DVC_FIRST..=ty::VIDEO_DVC_LAST) => {
                 self.set_state(ctx, VideoState::Active);
                 let mut fb = ctx.shared.fb.lock().unwrap();
-                let r = self.dvc.push_packet(t, &m.payload, &mut fb);
-                drop(fb);
+                // Recorded before decoding, so a new recording can start
+                // with the picture this packet builds on.
                 if let Some(w) = ctx.shared.recorder.lock().unwrap().as_mut() {
-                    if let Err(e) = w.packet(t, &m.payload) {
+                    if let Err(e) = w.packet(t, &m.payload, &fb) {
                         log::error!("recording: {e}");
                         (ctx.notify)();
                     }
                 }
+                let r = self.dvc.push_packet(t, &m.payload, &mut fb);
+                drop(fb);
                 match r {
                     Ok(true) => {
                         ctx.shared.frames.fetch_add(1, Ordering::Relaxed);
