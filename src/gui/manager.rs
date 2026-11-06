@@ -49,6 +49,7 @@ enum Open {
     Console,
     BootCaptures,
     Health,
+    Sessions,
     Power(PowerAction),
     Identify(u8),
 }
@@ -121,6 +122,11 @@ impl ManagerWindow {
             Open::Health => {
                 if let Some(m) = self.monitor(idx) {
                     shell.open.push(Box::new(HealthWindow::new(inst, m.client.clone())));
+                }
+            }
+            Open::Sessions => {
+                if let Some(m) = self.monitor(idx) {
+                    shell.open.push(Box::new(HealthWindow::new(inst, m.client.clone()).with_tab(super::health::Tab::Sessions)));
                 }
             }
             Open::Power(a) => {
@@ -386,6 +392,9 @@ impl ManagerWindow {
                             if ui.button("Serial console").on_hover_text("The server's serial port (COM2) over SSH, in a terminal. Ctrl+\\ ends it.").clicked() {
                                 action = Some(Action::Ssh(ssh::Mode::Serial));
                             }
+                            if ui.button("Sessions…").on_hover_text("Who is logged in to the iDRAC; close leftover sessions").clicked() {
+                                action = Some(Action::Sessions);
+                            }
                             ui.separator();
                             if ui.button("Blink identify LED (1 minute)").on_hover_text("Find the server in the rack by its blinking blue light").clicked() {
                                 action = Some(Action::Identify(60));
@@ -536,6 +545,7 @@ enum Action {
     Power(PowerAction),
     Identify(u8),
     Ssh(ssh::Mode),
+    Sessions,
     Refresh,
     Edit,
     Remove,
@@ -726,6 +736,7 @@ impl WindowUi for ManagerWindow {
                 Some((i, Action::Console)) => self.act_or_prompt(i, Open::Console, shell),
                 Some((i, Action::Captures)) => self.act_or_prompt(i, Open::BootCaptures, shell),
                 Some((i, Action::Health)) => self.act_or_prompt(i, Open::Health, shell),
+                Some((i, Action::Sessions)) => self.act_or_prompt(i, Open::Sessions, shell),
                 Some((i, Action::Proxy)) => self.toggle_proxy(i),
                 Some((i, Action::Power(a))) => self.confirm_power = Some((i, a)),
                 Some((i, Action::Identify(s))) => self.act_or_prompt(i, Open::Identify(s), shell),

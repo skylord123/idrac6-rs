@@ -367,6 +367,63 @@ pub fn parse_sel(xml: &str) -> Vec<SelEntry> {
     v
 }
 
+/// A login on the iDRAC (web, console, virtual media, SSH...).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdracSession {
+    pub id: u32,
+    pub user: String,
+    pub ip: String,
+    /// The kind, named like the web UI does ("Virtual Console", "SSH"...).
+    pub kind: String,
+    /// The iDRAC lets it be closed.
+    pub killable: bool,
+    /// The session idrac6 itself reads this list with.
+    pub own: bool,
+}
+
+/// Parse `activeSessions`, oldest first. `own` is the reader's session.
+pub fn parse_sessions(xml: &str, own: Option<u32>) -> Vec<IdracSession> {
+    let mut v: Vec<IdracSession> = xml_elements(xml, "session")
+        .into_iter()
+        .filter_map(|e| {
+            let id = xml_value(e, "sessionId")?.trim().parse().ok()?;
+            let raw = xml_unescape(xml_value(e, "sessionType").unwrap_or(""));
+            // Names from the web UI's Sessions page.
+            let kind = match raw.as_str() {
+                "webgui" => "Web".to_string(),
+                "CLP" => "SSH / Telnet (SM-CLP)".to_string(),
+                "racadm" => "RACADM".to_string(),
+                "vKVM" => "Virtual Console".to_string(),
+                "vMedia" => "Virtual Media".to_string(),
+                _ => raw,
+            };
+            Some(IdracSession {
+                id,
+                user: xml_unescape(xml_value(e, "userName").unwrap_or("")),
+                ip: xml_unescape(xml_value(e, "ipAddress").unwrap_or("")),
+                kind,
+                killable: xml_value(e, "isKillable").is_some_and(|k| k.trim() == "1") && Some(id) != own,
+                own: Some(id) == own,
+            })
+        })
+        .collect();
+    v.sort_by_key(|s| s.id);
+    v
+}
+
+/// The web UI's Sessions page has the reader's own session id in a
+/// script: declared as `mySessionId = -1;`, then set with
+/// `mySessionId = 189 ;`.
+fn parse_own_session(html: &str) -> Option<u32> {
+    html.match_indices("mySessionId")
+        .filter_map(|(i, k)| {
+            let rest = html[i + k.len()..].trim_start().strip_prefix('=')?.trim_start();
+            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        })
+        .last()
+}
+
 /// `data?set=pwState:<n>` values (from the web UI's power control page).
 pub fn power_state_value(a: PowerAction) -> u8 {
     match a {
@@ -411,6 +468,18 @@ pub fn sel_csv(c: &WebClient) -> Result<Vec<u8>> {
 
 pub fn clear_sel(c: &WebClient) -> Result<()> {
     c.set("clearSEL:1").map(drop)
+}
+
+pub fn fetch_sessions(c: &WebClient) -> Result<Vec<IdracSession>> {
+    let xml = c.data("activeSessions")?;
+    // Which one is ours; the list is still useful without it.
+    let own = c.get("/ssninfo.html").ok().filter(|r| r.status == 200).and_then(|r| parse_own_session(&r.text()));
+    Ok(parse_sessions(&xml, own))
+}
+
+/// Log a session out (the trash can on the web UI's Sessions page).
+pub fn close_session(c: &WebClient, id: u32) -> Result<()> {
+    c.set(&format!("killSession({id})")).map(drop)
 }
 
 /// Power control through the web interface (same as its Power page).
@@ -566,6 +635,19 @@ mod tests {
         assert_eq!(e[0].severity, Health::Critical);
         assert_eq!(e[0].description, "PS 1 input lost & restored");
         assert_eq!(e[1].date, "Thu Aug 19 2010 04:32:47");
+    }
+
+    #[test]
+    fn parses_sessions() {
+        let xml = "<root><sessionList><session><sessionId>190</sessionId>\n<userName>root</userName>\n<ipAddress>192.0.2.82</ipAddress>\n<sessionType>webgui</sessionType>\n<consoleType>webgui</consoleType>\n<isKillable>1</isKillable>\n</session><session><sessionId>175</sessionId>\n<userName>admin</userName>\n<ipAddress>10.0.0.9</ipAddress>\n<sessionType>vKVM</sessionType>\n<isKillable>1</isKillable>\n</session><session><sessionId>12</sessionId><userName>root</userName><ipAddress>10.0.0.2</ipAddress><sessionType>CLP</sessionType><isKillable>0</isKillable></session></sessionList><status>ok</status></root>";
+        let html = "var mySessionId = -1;        // 06/11/08 rbj\n<script>\n        mySessionId = 190 ;\n";
+        let own = parse_own_session(html);
+        assert_eq!(own, Some(190));
+        let s = parse_sessions(xml, own);
+        assert_eq!(s.iter().map(|s| s.id).collect::<Vec<_>>(), [12, 175, 190]);
+        assert_eq!((s[0].kind.as_str(), s[0].killable), ("SSH / Telnet (SM-CLP)", false));
+        assert_eq!((s[1].kind.as_str(), s[1].user.as_str(), s[1].ip.as_str(), s[1].killable, s[1].own), ("Virtual Console", "admin", "10.0.0.9", true, false));
+        assert_eq!((s[2].kind.as_str(), s[2].killable, s[2].own), ("Web", false, true));
     }
 
     #[test]

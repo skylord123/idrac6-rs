@@ -1,5 +1,5 @@
-//! Health window: system overview, sensors, power use and the System
-//! Event Log of one server.
+//! Health window: system overview, sensors, power use, the System Event
+//! Log and the iDRAC's login sessions of one server.
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -12,7 +12,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use super::{Shell, UserEvent, WindowUi};
 use crate::config::Instance;
-use crate::health::{self, Health, PowerStats, SelEntry, Sensor, SensorKind, Summary};
+use crate::health::{self, Health, IdracSession, PowerStats, SelEntry, Sensor, SensorKind, Summary};
 use crate::web::WebClient;
 
 /// Sensors and power refresh this often while their tab is shown.
@@ -74,11 +74,12 @@ impl<T: Send + 'static> Load<T> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
+pub enum Tab {
     Overview,
     Sensors,
     Power,
     Log,
+    Sessions,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,9 @@ pub struct HealthWindow {
     sensors: Load<Vec<Sensor>>,
     power: Load<PowerStats>,
     sel: Load<Vec<SelEntry>>,
+    sessions: Load<Vec<IdracSession>>,
+    /// Asking before logging a session out.
+    confirm_close: Option<IdracSession>,
     log_filter: LogFilter,
     log_search: String,
     confirm_clear: bool,
@@ -116,12 +120,20 @@ impl HealthWindow {
             sensors: Load::default(),
             power: Load::default(),
             sel: Load::default(),
+            sessions: Load::default(),
+            confirm_close: None,
             log_filter: LogFilter::All,
             log_search: String::new(),
             confirm_clear: false,
             log_job: None,
             message: None,
         }
+    }
+
+    /// Open on `tab` instead of the overview.
+    pub fn with_tab(mut self, tab: Tab) -> Self {
+        self.tab = tab;
+        self
     }
 
     /// Fetch what the current tab shows, if it is missing or old.
@@ -155,11 +167,16 @@ impl HealthWindow {
                     self.sel.start(&c, &n, health::fetch_sel);
                 }
             }
+            Tab::Sessions => {
+                if force || self.sessions.data.is_none() {
+                    self.sessions.start(&c, &n, health::fetch_sessions);
+                }
+            }
         }
     }
 
     fn loading(&self) -> bool {
-        self.summary.loading() || self.sensors.loading() || self.power.loading() || self.sel.loading() || self.log_job.is_some()
+        self.summary.loading() || self.sensors.loading() || self.power.loading() || self.sel.loading() || self.sessions.loading() || self.log_job.is_some()
     }
 
     fn tab_error(&self) -> Option<&String> {
@@ -168,6 +185,7 @@ impl HealthWindow {
             Tab::Sensors => self.sensors.error.as_ref(),
             Tab::Power => self.power.error.as_ref(),
             Tab::Log => self.sel.error.as_ref(),
+            Tab::Sessions => self.sessions.error.as_ref(),
         }
     }
 
@@ -177,6 +195,7 @@ impl HealthWindow {
             Tab::Sensors => self.sensors.at,
             Tab::Power => self.power.at,
             Tab::Log => self.sel.at,
+            Tab::Sessions => self.sessions.at,
         }
     }
 
@@ -419,6 +438,57 @@ impl HealthWindow {
         });
     }
 
+    fn sessions_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label("Everyone logged in to this iDRAC. The iDRAC6 allows only a few sessions at a time; close ones left over from closed browsers or viewers that crashed.");
+        ui.add_space(8.0);
+        let Some(list) = &self.sessions.data else {
+            loading_note(ui, self.sessions.loading());
+            return;
+        };
+        if list.is_empty() {
+            ui.weak("No sessions.");
+            return;
+        }
+        let mut close = None;
+        egui::Grid::new("sessions").num_columns(5).striped(true).spacing([24.0, 8.0]).show(ui, |ui| {
+            for h in ["Type", "User", "From", "ID", ""] {
+                ui.label(egui::RichText::new(h).strong());
+            }
+            ui.end_row();
+            for s in list {
+                ui.label(&s.kind);
+                ui.label(&s.user);
+                ui.label(&s.ip);
+                ui.weak(s.id.to_string());
+                if s.own {
+                    ui.weak("This app").on_hover_text("The session idrac6 uses to read this list");
+                } else if s.killable {
+                    if ui.button("Close").on_hover_text("Log this session out").clicked() {
+                        close = Some(s.clone());
+                    }
+                } else {
+                    ui.weak("Can't be closed");
+                }
+                ui.end_row();
+            }
+        });
+        if close.is_some() {
+            self.confirm_close = close;
+        }
+    }
+
+    fn close_session(&mut self, id: u32) {
+        let (tx, rx) = mpsc::channel();
+        let (c, n) = (self.client.clone(), self.notify.clone());
+        thread::spawn(move || {
+            let _ = tx.send(health::close_session(&c, id).map(|()| format!("Session {id} was closed.")));
+            if let Some(n) = n {
+                n();
+            }
+        });
+        self.log_job = Some(rx);
+    }
+
     fn save_csv(&mut self) {
         let name = format!("{}-event-log.csv", self.inst.title().replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
         let Some(path) = rfd::FileDialog::new().set_file_name(&name).add_filter("CSV", &["csv"]).save_file() else { return };
@@ -454,13 +524,20 @@ impl HealthWindow {
         match rx.try_recv() {
             Ok(r) => {
                 let cleared = r.as_ref().is_ok_and(|m| m.contains("cleared"));
-                self.message = Some(match r {
-                    Ok(m) => m,
-                    Err(e) => format!("{e:#}"),
-                });
+                let session = self.tab == Tab::Sessions;
+                // A closed session just disappears from the list.
+                if !(session && r.is_ok()) {
+                    self.message = Some(match r {
+                        Ok(m) => m,
+                        Err(e) => format!("{e:#}"),
+                    });
+                }
                 self.log_job = None;
                 if cleared {
                     self.sel.data = None;
+                    self.load_tab(true);
+                }
+                if session {
                     self.load_tab(true);
                 }
             }
@@ -490,6 +567,28 @@ impl HealthWindow {
             });
             if close {
                 self.confirm_clear = false;
+            }
+        }
+        if let Some(s) = self.confirm_close.clone() {
+            let mut close = false;
+            egui::Modal::new(egui::Id::unique("close-session")).show(ctx, |ui| {
+                ui.set_max_width(400.0);
+                ui.heading("Close this session?");
+                ui.label(format!("{} session {} of {} from {}.", s.kind, s.id, s.user, s.ip));
+                ui.weak("Whoever is using it is logged out. Unsaved changes in it are lost.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Close session").clicked() {
+                        self.close_session(s.id);
+                        close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if close {
+                self.confirm_close = None;
             }
         }
         if let Some(m) = self.message.clone() {
@@ -622,12 +721,13 @@ impl WindowUi for HealthWindow {
         self.sensors.poll();
         self.power.poll();
         self.sel.poll();
+        self.sessions.poll();
         self.poll_job();
         self.load_tab(false);
         egui::Panel::top("tabs").show(root, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                for (t, label) in [(Tab::Overview, "Overview"), (Tab::Sensors, "Sensors"), (Tab::Power, "Power"), (Tab::Log, "Event log")] {
+                for (t, label) in [(Tab::Overview, "Overview"), (Tab::Sensors, "Sensors"), (Tab::Power, "Power"), (Tab::Log, "Event log"), (Tab::Sessions, "Sessions")] {
                     if ui.selectable_label(self.tab == t, egui::RichText::new(label).size(15.0)).clicked() && self.tab != t {
                         self.tab = t;
                         self.load_tab(false);
@@ -660,6 +760,7 @@ impl WindowUi for HealthWindow {
                     match tab {
                         Tab::Overview => self.overview(ui),
                         Tab::Sensors => self.sensors_tab(ui),
+                        Tab::Sessions => self.sessions_tab(ui),
                         _ => self.power_tab(ui),
                     }
                 });

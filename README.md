@@ -12,7 +12,8 @@ servers (PowerEdge R610, R710, T610 and friends), without Java.
   server as a USB CD/DVD or disk.
 - **Web UI proxy**: open the iDRAC web interface in a modern browser. The
   proxy talks the iDRAC's TLS 1.0 for you.
-- **Health**: sensors, power use and the System Event Log.
+- **Health**: sensors, power use, the System Event Log, and who is
+  logged in to the iDRAC (with a button to close leftover sessions).
 - **SSH and serial console**: open the iDRAC's command line, or the
   server's serial console (serial over LAN), in your terminal with one
   click.
@@ -95,6 +96,12 @@ Click **Health** for the server's details, every sensor with its limits,
 power use over the last minute, hour, day and week with peaks and energy
 used, and the System Event Log. The log can be filtered by severity,
 searched, saved as CSV and cleared.
+
+The **Sessions** tab (also **More → Sessions…**) lists everyone logged
+in to the iDRAC: web, virtual console, virtual media, SSH and RACADM,
+with user and address. **Close** logs a session out, for example one left
+by a browser that was closed without logging out or a viewer that
+crashed. The iDRAC6 allows only a few sessions at a time.
 
 ### Virtual console
 
@@ -259,8 +266,8 @@ binary, or `IDRAC6_SSH` to use a specific `ssh`.
 ## Troubleshooting
 
 - **"Login failed: too many web sessions"**: the iDRAC6 allows only a few
-  web sessions. Log out elsewhere or wait a few minutes for old sessions
-  to expire.
+  web sessions. Close leftover ones under **More → Sessions…**, log out
+  elsewhere, or wait a few minutes for old sessions to expire.
 - **"The virtual console is already in use"**: someone (or a crashed
   viewer) has it open. Use *Ask the current user to share*, or wait for the
   old session to time out.
