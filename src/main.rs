@@ -22,6 +22,9 @@ USAGE:
     idrac6 captures <name|host> Replay the boot recordings of a saved iDRAC
     idrac6 play <file>          Replay a console recording (.dvcrec) or a
                                 boot capture file
+    idrac6 export <file> [<out.mp4>]
+                                Convert a recording to an MP4 video (needs
+                                FFmpeg)
     idrac6 mount <name|host> <image> [--read-write]
                                 Attach an .iso (CD/DVD) or .img (disk) as
                                 virtual media until Enter is pressed
@@ -31,6 +34,7 @@ USAGE:
 
 ENVIRONMENT:
     RUST_LOG=debug              More logging (also: info, trace)
+    IDRAC6_FFMPEG=<path>        FFmpeg to use for MP4 videos
     IDRAC6_CONFIG_DIR=<dir>     Use a different settings directory
 ";
 
@@ -66,6 +70,10 @@ fn main() {
             Some(f) => gui::run(Box::new(gui::PlaybackWindow::from_file(f.into()))),
             None => Err(anyhow::anyhow!("usage: idrac6 play <file>")),
         },
+        Some("export") => match (args.get(1), args.get(2)) {
+            (Some(f), out) => export(f.as_ref(), out.map(Into::into)),
+            _ => Err(anyhow::anyhow!("usage: idrac6 export <file> [<out.mp4>]")),
+        },
         Some("mount") => (|| {
             let (Some(want), Some(image)) = (args.get(1), args.get(2)) else {
                 anyhow::bail!("usage: idrac6 mount <name|host> <image> [--read-write]");
@@ -79,6 +87,27 @@ fn main() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// `idrac6 export`: recording file to MP4.
+fn export(file: &std::path::Path, out: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    use std::io::Write;
+    let out = out.unwrap_or_else(|| file.with_extension("mp4"));
+    if out.exists() {
+        anyhow::bail!("{} already exists", out.display());
+    }
+    let ff = video::mp4::find().map_err(|e| anyhow::anyhow!("{e}. Install FFmpeg (https://ffmpeg.org/download.html) or set IDRAC6_FFMPEG."))?;
+    let data = std::fs::read(file).map_err(|e| anyhow::anyhow!("could not read {}: {e}", file.display()))?;
+    let rec = video::playback::parse(&data)?;
+    let done = video::mp4::encode(&ff, &rec, &out, &mut |p| {
+        eprint!("\rWriting {}: {:3.0}%", out.display(), p * 100.0);
+        let _ = std::io::stderr().flush();
+        true
+    })?;
+    eprintln!();
+    let s = done.duration.as_secs();
+    println!("Saved {} ({}:{:02}, {:.1} MB)", done.path.display(), s / 60, s % 60, done.bytes as f64 / 1e6);
+    Ok(())
 }
 
 /// Look up a saved iDRAC by name or address; it must have a saved password.

@@ -160,6 +160,17 @@ height and begin/end flags and the time since recording started. They can
 be longer than 2 MiB; the player reads the whole file. Packets of other
 types are not recorded (iDRAC6 only sends `0x81`).
 
+### MP4 export
+
+`video::mp4` decodes a recording with the normal decoder and pipes the
+pictures to FFmpeg as raw `yuv420p` at 15 frames per second, using the
+real record timestamps (no 1000 ms cap). The video is as large as the
+largest picture in the recording; smaller pictures (text mode during
+boot) are scaled to fit and centred. FFmpeg's `mpdecimate` filter drops
+repeated pictures, keeping one a second, so still screens cost almost
+nothing. libx264 is used when FFmpeg has it, then libopenh264, h264_mf
+and mpeg4.
+
 ### Timing and controls
 
 `com.avocent.kvm.d.a.b` sleeps `timestamp - previous timestamp` before

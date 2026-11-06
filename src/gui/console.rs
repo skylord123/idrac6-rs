@@ -1299,7 +1299,7 @@ fn timestamp() -> String {
     format!("{y:04}-{m:02}-{d:02}_{:02}{:02}{:02}", rem / 3600, rem / 60 % 60, rem % 60)
 }
 
-fn file_safe(name: &str) -> String {
+pub(super) fn file_safe(name: &str) -> String {
     name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '.', "_")
 }
 

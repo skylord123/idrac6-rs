@@ -9,6 +9,7 @@ mod console;
 mod health;
 mod manager;
 mod monitor;
+mod mp4;
 mod playback;
 mod vmedia;
 

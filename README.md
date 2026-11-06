@@ -6,7 +6,8 @@ servers (PowerEdge R610, R710, T610 and friends), without Java.
 - **Virtual console**: see the server's screen, use keyboard and mouse,
   send Ctrl-Alt-Del and other macros, power control, screenshots.
 - **Boot captures**: replay the iDRAC's recordings of the last boots.
-- **Recording**: record a console session to a file and replay it.
+- **Recording**: record a console session to a file and replay it, and
+  export recordings and boot captures as MP4 videos.
 - **Virtual Media**: attach an ISO or disk image from your computer to the
   server as a USB CD/DVD or disk.
 - **Web UI proxy**: open the iDRAC web interface in a modern browser. The
@@ -37,6 +38,12 @@ Download the latest build from the
 - **Windows**: `idrac6-windows-x86_64.zip`. Unzip and run `idrac6.exe`.
 - **Other Linux**: `idrac6-linux-x86_64.tar.gz`. Extract and run
   `./idrac6`. Needs a desktop with OpenGL (X11 or Wayland).
+
+MP4 videos need [FFmpeg](https://ffmpeg.org/download.html), which is not
+included: `sudo apt install ffmpeg` on Ubuntu/Debian, `winget install
+Gyan.FFmpeg` on Windows (or put `ffmpeg.exe` next to `idrac6.exe`).
+Everything else works without it, and idrac6-rs tells you when it's
+missing.
 
 Or build it yourself (Rust 1.85 or newer):
 
@@ -167,6 +174,10 @@ bar and playback speed. Handy for seeing a BIOS error or kernel panic that
 scrolled past. From the command line: `idrac6 captures "R710 lab"`.
 **Open…** in the player (or `idrac6 play <file>`) plays recording files.
 
+**Export MP4…** in the player saves the recording as an MP4 video, with
+its real timing (the player shortens long pauses; the video doesn't).
+From the command line: `idrac6 export recording.dvcrec [video.mp4]`.
+
 ### Web interface
 
 Click **Web UI**. This starts a local proxy and opens
@@ -203,8 +214,9 @@ versions are moved there on the next start. Without a keyring service
 password" to be asked each time instead. The proxy's certificate and
 key are stored in the same directory.
 
-Set `RUST_LOG=debug` for detailed logs, or `IDRAC6_CONFIG_DIR` to use
-another settings directory.
+Set `RUST_LOG=debug` for detailed logs, `IDRAC6_CONFIG_DIR` to use
+another settings directory, or `IDRAC6_FFMPEG` to use a specific FFmpeg
+binary.
 
 ## Troubleshooting
 
@@ -241,6 +253,7 @@ src/
   kvm/           console protocol: messages, session, keyboard map
   video/dvc.rs   DVC video decoder (what iDRAC6 sends)
   video/playback.rs  boot capture recordings
+  video/mp4.rs   MP4 export through FFmpeg
   video/aspeed.rs  ASPEED video decoder
   vmedia/        Virtual Media protocol and image serving
   web.rs         iDRAC web login and viewer.jnlp

@@ -11,9 +11,11 @@ use winit::dpi::LogicalSize;
 use winit::event_loop::EventLoopProxy;
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use super::mp4::{Choice, FfmpegDialog};
 use super::{Shell, UserEvent, WindowUi};
 use crate::config::Instance;
 use crate::video::Framebuffer;
+use crate::video::mp4::{self as video_mp4, Done, Export, Ffmpeg};
 use crate::video::playback::{self, Player};
 use crate::web::{BootCapture, WebSession};
 
@@ -44,6 +46,10 @@ pub struct PlaybackWindow {
     proxy: Option<EventLoopProxy<UserEvent>>,
     message: Option<String>,
     pending_load: Option<usize>,
+    /// Export MP4 in progress.
+    export: Option<Export>,
+    ffmpeg_dialog: Option<FfmpegDialog>,
+    exported: Option<Done>,
 }
 
 impl PlaybackWindow {
@@ -75,6 +81,9 @@ impl PlaybackWindow {
             proxy: None,
             message: None,
             pending_load: None,
+            export: None,
+            ffmpeg_dialog: None,
+            exported: None,
         }
     }
 
@@ -278,12 +287,80 @@ impl PlaybackWindow {
                     self.message = Some(format!("Could not copy the picture: {e:#}"));
                 }
             }
+            ui.separator();
+            let len = self.player.as_ref().map(|p| video_mp4::video_duration(&p.recording)).unwrap_or_default();
+            if ui
+                .add_enabled(self.export.is_none(), egui::Button::new("Export MP4…"))
+                .on_hover_text(format!(
+                    "Save the whole recording as an MP4 video ({}). The video keeps the real timing, so it can be longer than here, where long pauses are shortened. Needs FFmpeg.",
+                    mmss(len)
+                ))
+                .clicked()
+            {
+                self.export_mp4(None);
+            }
         });
+        if let Some(job) = &self.export {
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                let name = job.out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                cancel = ui.button("Cancel").on_hover_text("Stop making the video").clicked();
+                let p = job.progress();
+                ui.add(egui::ProgressBar::new(p).text(format!("Exporting {name}: {:.0}%", p * 100.0)));
+            });
+            if cancel {
+                if let Some(job) = self.export.as_mut() {
+                    job.cancel();
+                }
+            }
+        }
         let mut secs = self.pos.min(total).as_secs_f32();
         ui.spacing_mut().slider_width = ui.available_width();
         let slider = egui::Slider::new(&mut secs, 0.0..=total.as_secs_f32().max(0.1)).show_value(false);
         if ui.add(slider).changed() {
             self.seek(Duration::from_secs_f32(secs));
+        }
+    }
+
+    /// Export MP4: check for FFmpeg, ask where, start.
+    fn export_mp4(&mut self, ff: Option<Ffmpeg>) {
+        let ff = match ff.map(Ok).unwrap_or_else(super::mp4::require) {
+            Ok(ff) => ff,
+            Err(d) => {
+                self.ffmpeg_dialog = Some(d);
+                return;
+            }
+        };
+        let Some(rec) = self.player.as_ref().map(|p| p.recording.clone()) else { return };
+        let mut d = rfd::FileDialog::new().add_filter("MP4 video", &["mp4"]);
+        match (&self.file, &self.inst, &self.state) {
+            (Some(f), _, _) => {
+                let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "recording".into());
+                d = d.set_file_name(format!("{stem}.mp4"));
+                if let Some(dir) = f.parent() {
+                    d = d.set_directory(dir);
+                }
+            }
+            (None, Some(i), State::Playing(list)) => {
+                let date = list.get(self.selected).map(|c| c.date.trim().to_string()).unwrap_or_default();
+                d = d.set_file_name(format!("{}-boot-{}.mp4", super::console::file_safe(i.title()), super::console::file_safe(&date)));
+            }
+            _ => d = d.set_file_name("recording.mp4"),
+        }
+        let Some(out) = d.save_file() else { return };
+        let out = super::mp4::with_mp4_extension(out);
+        self.export = Some(Export::start(ff, move || Ok(rec), out, self.notifier()));
+    }
+
+    fn poll_export(&mut self) {
+        let Some(job) = self.export.as_mut() else { return };
+        let Some(r) = job.poll().cloned() else { return };
+        let cancelled = job.was_cancelled();
+        self.export = None;
+        match r {
+            Ok(done) => self.exported = Some(done),
+            Err(_) if cancelled => {}
+            Err(e) => self.message = Some(format!("Could not make the MP4 video: {e}")),
         }
     }
 
@@ -333,6 +410,7 @@ impl WindowUi for PlaybackWindow {
     fn ui(&mut self, root: &mut egui::Ui, _window: &Window, _shell: &mut Shell) {
         let ctx = root.ctx().clone();
         self.poll();
+        self.poll_export();
         if let Some(i) = self.pending_load.take() {
             if let State::Playing(list) = &self.state {
                 let list = list.clone();
@@ -383,8 +461,37 @@ impl WindowUi for PlaybackWindow {
                 ui.centered_and_justified(|ui| ui.add(egui::Image::new(sized)));
             }
         });
+        if let Some(d) = self.ffmpeg_dialog.as_mut() {
+            if let Some(c) = d.show(&ctx) {
+                self.ffmpeg_dialog = None;
+                if let Choice::Found(ff) = c {
+                    self.export_mp4(Some(ff));
+                }
+            }
+        }
+        if let Some(done) = self.exported.clone() {
+            let mut close = false;
+            egui::Modal::new(egui::Id::unique("pb-exported")).show(&ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.heading("Video saved");
+                ui.add_space(4.0);
+                ui.label(format!("{}.", super::mp4::describe(done.duration, done.bytes)));
+                ui.weak(done.path.display().to_string());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    super::mp4::open_buttons(ui, &done.path);
+                    if ui.button("OK").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if close {
+                self.exported = None;
+            }
+        }
         if let Some(m) = self.message.clone() {
             egui::Modal::new(egui::Id::unique("pb-msg")).show(&ctx, |ui| {
+                ui.set_max_width(480.0);
                 ui.label(m);
                 if ui.button("OK").clicked() {
                     self.message = None;
