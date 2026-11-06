@@ -20,6 +20,14 @@ pub fn run(inst: Instance, image: PathBuf, kind: Option<DriveKind>, read_write: 
     });
     std::fs::metadata(&image).with_context(|| format!("cannot read {}", image.display()))?;
 
+    // Enter, end of input, Ctrl+C and SIGTERM all unmap and log out.
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let tx = stop_tx.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    }) {
+        log::warn!("cannot handle Ctrl+C: {e}");
+    }
     eprintln!("Logging in to {}…", inst.host);
     let web = WebSession::login(&inst.host, inst.https_port, &inst.username, &inst.password)?;
     let result = (|| {
@@ -31,16 +39,15 @@ pub fn run(inst: Instance, image: PathBuf, kind: Option<DriveKind>, read_write: 
         let port = params.kmport;
         // Virtual Media credentials are handed out on a console session.
         let kvm = KvmSession::start(params, Arc::new(|| {}));
-        let (user, password) = wait_for_credentials(&kvm)?;
+        let (user, password) = wait_for_credentials(&kvm, &stop_rx)?;
 
         let (tx, rx) = mpsc::channel();
         let cfg = VmConfig { host: inst.host.clone(), port, username: user, password, preempt: false };
         let vm = VmSession::connect(cfg, tx)?;
         let img = VmImage { path: image.clone(), kind, read_only: !read_write };
         vm.map(img)?;
-        eprintln!("Mapped {} as {:?}. Press Enter to unmap.", image.display(), kind);
+        eprintln!("Mapped {} as {:?}. Press Enter (or Ctrl+C) to unmap.", image.display(), kind);
 
-        let (stop_tx, stop_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = std::io::stdin().lock().read_line(&mut String::new());
             let _ = stop_tx.send(());
@@ -76,10 +83,14 @@ pub fn run(inst: Instance, image: PathBuf, kind: Option<DriveKind>, read_write: 
     result
 }
 
-fn wait_for_credentials(kvm: &KvmSession) -> Result<(String, String)> {
+fn wait_for_credentials(kvm: &KvmSession, stop: &mpsc::Receiver<()>) -> Result<(String, String)> {
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut requested = false;
     while Instant::now() < deadline {
+        if stop.try_recv().is_ok() {
+            kvm.close();
+            bail!("interrupted");
+        }
         match kvm.events.recv_timeout(Duration::from_millis(250)) {
             Ok(KvmEvent::Running) if !requested => {
                 kvm.request_vm_credentials();

@@ -34,6 +34,9 @@ pub use playback::PlaybackWindow;
 pub enum UserEvent {
     /// Repaint a window, optionally after a delay.
     Repaint(WindowId, std::time::Duration),
+    /// Ctrl+C or SIGTERM: close every window (logging out of the iDRACs)
+    /// and exit.
+    Quit,
 }
 
 /// Window attributes shared by all windows: icon and the application id
@@ -114,6 +117,12 @@ struct App {
 pub fn run(first: Box<dyn WindowUi>) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+    let quit = proxy.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        let _ = quit.send_event(UserEvent::Quit);
+    }) {
+        log::warn!("cannot handle Ctrl+C: {e}");
+    }
     let mut app = App { proxy, gl_config: None, windows: HashMap::new(), pending: vec![first] };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -275,8 +284,15 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, ev: UserEvent) {
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         match ev {
+            UserEvent::Quit => {
+                log::info!("quitting on signal");
+                for w in self.windows.values_mut() {
+                    w.ui.close_requested();
+                }
+                el.exit();
+            }
             UserEvent::Repaint(id, delay) => {
                 if let Some(w) = self.windows.get_mut(&id) {
                     if delay.is_zero() {
