@@ -1084,16 +1084,25 @@ impl ConsoleWindow {
                 Some(VideoState::Stopped(c)) => (format!("Video is blocked or stopped by the iDRAC (code {c})."), false),
                 _ => (self.status.clone(), true),
             };
+            // Painted rather than added as widgets: a label would take the
+            // pointer, and clicks and keys over the text would not reach
+            // the server.
             let rect = resp.rect;
-            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(rect.height() / 3.0);
-                    if spinner {
-                        ui.spinner();
-                    }
-                    ui.label(egui::RichText::new(text).color(egui::Color32::from_gray(200)));
-                });
-            });
+            let mut y = rect.top() + rect.height() / 3.0;
+            if spinner {
+                let size = ui.style().spacing.interact_size.y;
+                egui::Spinner::new().paint_at(ui, egui::Rect::from_center_size(egui::pos2(rect.center().x, y + size / 2.0), egui::vec2(size, size)));
+                y += size + ui.style().spacing.item_spacing.y;
+            }
+            let mut job = egui::text::LayoutJob::simple(
+                text,
+                egui::TextStyle::Body.resolve(ui.style()),
+                egui::Color32::from_gray(200),
+                (rect.width() - 32.0).max(100.0),
+            );
+            job.halign = egui::Align::Center;
+            let galley = ui.painter().layout_job(job);
+            ui.painter().galley(egui::pos2(rect.center().x, y), galley, egui::Color32::from_gray(200));
             return;
         };
         let [tw, th] = tex.size();
