@@ -48,6 +48,8 @@ pub enum KvmEvent {
     PowerState(proto::ServerInfo),
     SharingRequest(proto::SharingRequest),
     VideoState(VideoState),
+    /// Current mouse acceleration setting (see [`proto::MouseAccel`]).
+    MouseAccel(u8),
     /// Credentials for the virtual media channel (answer to
     /// [`KvmSession::request_vm_credentials`]).
     VmCredentials { user: String, password: String },
@@ -362,6 +364,7 @@ fn command_thread(ctx: &Ctx, outgoing: Receiver<Vec<u8>>) -> Result<()> {
                     ctx.send(KvmEvent::Resolution(w, h));
                     write_all(&mut conn, &proto::screen_refresh())?;
                 }
+                ty::MOUSE_ACCEL_RESPONSE => ctx.send(KvmEvent::MouseAccel(m.payload.first().copied().unwrap_or(0))),
                 ty::KEYBOARD_LED => ctx.send(KvmEvent::Leds(proto::parse_leds(&m.payload))),
                 ty::SERVER_NAMES => {
                     if let Some(s) = proto::parse_server_names(&m.payload).into_iter().next() {

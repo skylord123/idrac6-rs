@@ -342,12 +342,50 @@ pub fn mouse_abs(x: u16, y: u16, buttons: u8, wheel: i16) -> Vec<u8> {
     beef(ty::MOUSE_ABS, &p)
 }
 
+/// Relative mouse movement (single cursor mode). Same layout as
+/// [`mouse_abs`] but `dx`/`dy` are signed deltas.
+pub fn mouse_rel(dx: i16, dy: i16, buttons: u8, wheel: i16) -> Vec<u8> {
+    let mut p = [0u8; 8];
+    p[1] = buttons;
+    p[2..4].copy_from_slice(&dx.to_be_bytes());
+    p[4..6].copy_from_slice(&dy.to_be_bytes());
+    p[6..8].copy_from_slice(&wheel.to_be_bytes());
+    beef(ty::MOUSE_REL, &p)
+}
+
+/// Re-centre the server's pointer before relative movement starts.
+pub fn mouse_origin() -> Vec<u8> {
+    beef(ty::MOUSE_ORIGIN, &[0; 8])
+}
+
 pub fn focus(has_focus: bool) -> Vec<u8> {
     beef(ty::FOCUS, &[has_focus as u8, 0, 0, 0, 0, 0, 0, 0])
 }
 
 pub fn keyboard_led_request() -> Vec<u8> {
     beef(ty::KEYBOARD_LED_REQUEST, &[0; 8])
+}
+
+/// How the iDRAC scales mouse movement; should match the server OS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseAccel {
+    None = 0,
+    Windows = 1,
+    Linux = 2,
+}
+
+impl MouseAccel {
+    pub const ALL: [MouseAccel; 3] = [Self::Windows, Self::Linux, Self::None];
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| *a as u8 == v)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Windows => "Windows",
+            Self::Linux => "Linux",
+        }
+    }
 }
 
 pub fn mouse_accel(value: u8) -> Vec<u8> {

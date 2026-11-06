@@ -75,6 +75,11 @@ pub trait WindowUi {
         false
     }
     fn focus_changed(&mut self, _focused: bool) {}
+    /// Raw relative mouse motion from the device (not limited by the window
+    /// edge). Return true to request a redraw.
+    fn raw_mouse_motion(&mut self, _dx: f64, _dy: f64) -> bool {
+        false
+    }
     /// The user asked to close the window. Return false to keep it open.
     fn close_requested(&mut self) -> bool {
         true
@@ -254,6 +259,16 @@ impl ApplicationHandler<UserEvent> for App {
         let resp = w.egui.on_window_event(&w.window, &event);
         if resp.repaint {
             w.window.request_redraw();
+        }
+    }
+
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        if let winit::event::DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            for w in self.windows.values_mut() {
+                if w.ui.raw_mouse_motion(dx, dy) {
+                    w.window.request_redraw();
+                }
+            }
         }
     }
 

@@ -46,6 +46,16 @@ pub struct ConsoleWindow {
     /// Connect with the "share" flag once the login finishes.
     pending_shared: bool,
     focused: bool,
+    mouse_accel: Option<u8>,
+    bandwidth: Bandwidth,
+    /// Single cursor mode: hide our pointer and send relative movement.
+    single_cursor: bool,
+    /// The pointer is currently captured for single cursor mode.
+    grabbed: bool,
+    want_grab: Option<bool>,
+    rel: (f64, f64),
+    rel_sent: Instant,
+    show_about: bool,
 
     texture: Option<egui::TextureHandle>,
     shown_seq: u64,
@@ -111,6 +121,14 @@ impl ConsoleWindow {
             in_use_retry: false,
             pending_shared: false,
             focused: true,
+            mouse_accel: None,
+            bandwidth: Bandwidth::Unlimited,
+            single_cursor: false,
+            grabbed: false,
+            want_grab: None,
+            rel: (0.0, 0.0),
+            rel_sent: Instant::now(),
+            show_about: false,
             texture: None,
             shown_seq: 0,
             fit: true,
@@ -240,6 +258,10 @@ impl ConsoleWindow {
                 KvmEvent::PowerState(p) => self.power = Some(p),
                 KvmEvent::SharingRequest(r) => self.sharing = Some(r),
                 KvmEvent::VideoState(v) => self.video_state = Some(v),
+                KvmEvent::MouseAccel(v) => {
+                    log::info!("iDRAC mouse acceleration: {:?}", proto::MouseAccel::from_u8(v));
+                    self.mouse_accel = Some(v);
+                }
                 KvmEvent::VmCredentials { user, password } => {
                     let port = self.info.as_ref().map(|i| i.kvm_params(&self.inst.host, false).kmport).unwrap_or(5900);
                     let notify = self.notifier();
@@ -328,6 +350,12 @@ impl ConsoleWindow {
                 }
             });
             ui.menu_button("View", |ui| {
+                if ui.add_enabled(self.session().is_some(), egui::Button::new("Refresh")).clicked() {
+                    if let Some(s) = self.session() {
+                        s.refresh();
+                    }
+                }
+                ui.separator();
                 ui.radio_value(&mut self.fit, true, "Fit to window");
                 ui.radio_value(&mut self.fit, false, "Actual size (1:1)");
                 ui.separator();
@@ -339,8 +367,6 @@ impl ConsoleWindow {
                         let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w as u32, h as u32 + 60));
                     }
                 }
-                ui.separator();
-                ui.checkbox(&mut self.show_stats, "Statistics");
             });
             ui.add_enabled_ui(self.can_input(), |ui| {
                 ui.menu_button("Keyboard", |ui| {
@@ -400,22 +426,45 @@ impl ConsoleWindow {
                 self.vm.open = true;
             }
             ui.add_enabled_ui(self.session().is_some(), |ui| {
-                ui.menu_button("Video", |ui| {
-                    if ui.button("Refresh screen").clicked() {
-                        if let Some(s) = self.session() {
-                            s.refresh();
-                        }
+                ui.menu_button("Tools", |ui| {
+                    if ui
+                        .checkbox(&mut self.single_cursor, "Single cursor")
+                        .on_hover_text("Hide the local pointer and move the server's pointer directly. Click the screen to start, press F9 to release.")
+                        .clicked()
+                        && !self.single_cursor
+                    {
+                        self.want_grab = Some(false);
                     }
-                    ui.menu_button("Bandwidth limit", |ui| {
-                        for b in Bandwidth::ALL {
-                            if ui.button(b.label()).clicked() {
+                    ui.menu_button("Mouse acceleration", |ui| {
+                        ui.weak("Match the server's operating system");
+                        for a in proto::MouseAccel::ALL {
+                            let selected = self.mouse_accel == Some(a as u8);
+                            if ui.radio(selected, a.label()).clicked() {
                                 if let Some(s) = self.session() {
-                                    s.send(proto::set_bandwidth(b as u8));
+                                    s.send(proto::mouse_accel(a as u8));
                                 }
+                                self.mouse_accel = Some(a as u8);
                             }
                         }
                     });
+                    ui.menu_button("Bandwidth limit", |ui| {
+                        for b in Bandwidth::ALL {
+                            if ui.radio(self.bandwidth == b, b.label()).clicked() {
+                                if let Some(s) = self.session() {
+                                    s.send(proto::set_bandwidth(b as u8));
+                                }
+                                self.bandwidth = b;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.checkbox(&mut self.show_stats, "Statistics");
                 });
+            });
+            ui.menu_button("Help", |ui| {
+                if ui.button("About").clicked() {
+                    self.show_about = true;
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 led(ui, "Scroll", self.leds.scroll);
@@ -474,7 +523,7 @@ impl ConsoleWindow {
             self.hovering_video = resp.hovered() || resp.dragged();
             if self.can_input() {
                 let (w, h) = self.resolution.map(|(w, h)| (w as f32, h as f32)).unwrap_or((1024.0, 768.0));
-                self.mouse_input(ui, &resp, w, h);
+                self.pointer_input(ui, &resp, w, h);
             }
             let wake = "Press a key or click here to wake the server's screen.";
             let (text, spinner) = match self.video_state {
@@ -517,11 +566,107 @@ impl ConsoleWindow {
         };
         self.hovering_video = resp.hovered() || resp.dragged();
         if self.can_input() {
-            self.mouse_input(ui, &resp, tw, th);
+            self.pointer_input(ui, &resp, tw, th);
         }
         if let (Some(VideoState::NoSignal | VideoState::OutOfRange), Some(_)) = (self.video_state, &self.texture) {
             let text = if self.video_state == Some(VideoState::NoSignal) { "No signal" } else { "Out of range" };
             ui.painter().text(resp.rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(24.0), egui::Color32::YELLOW);
+        }
+    }
+
+    /// Route pointer input to absolute or single cursor (relative) mode.
+    fn pointer_input(&mut self, ui: &egui::Ui, resp: &egui::Response, tw: f32, th: f32) {
+        if self.grabbed {
+            self.relative_buttons(ui);
+        } else if self.single_cursor && resp.clicked() {
+            self.want_grab = Some(true);
+        } else {
+            self.mouse_input(ui, resp, tw, th);
+        }
+    }
+
+    /// Buttons and wheel while the pointer is captured.
+    fn relative_buttons(&mut self, ui: &egui::Ui) {
+        let (primary, secondary, middle, scroll) = ui.input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.secondary_down(),
+                i.pointer.middle_down(),
+                i.raw.events.iter().fold(0.0f32, |acc, e| match e {
+                    egui::Event::MouseWheel { unit, delta, .. } => {
+                        acc + delta.y
+                            * match unit {
+                                egui::MouseWheelUnit::Point => 1.0,
+                                egui::MouseWheelUnit::Line => 40.0,
+                                egui::MouseWheelUnit::Page => 120.0,
+                            }
+                    }
+                    _ => acc,
+                }),
+            )
+        });
+        let mut b = 0;
+        if primary {
+            b |= buttons::LEFT;
+        }
+        if secondary {
+            b |= buttons::RIGHT;
+        }
+        if middle {
+            b |= buttons::MIDDLE;
+        }
+        self.wheel_acc += scroll;
+        let mut wheel = 0i16;
+        while self.wheel_acc >= 40.0 {
+            wheel += 1;
+            self.wheel_acc -= 40.0;
+        }
+        while self.wheel_acc <= -40.0 {
+            wheel -= 1;
+            self.wheel_acc += 40.0;
+        }
+        if b != self.mouse_buttons || wheel != 0 {
+            self.mouse_buttons = b;
+            self.flush_relative(true, wheel);
+        }
+    }
+
+    /// Send accumulated relative motion. Rate-limited to 100 messages/s
+    /// unless `force` (button or wheel change).
+    fn flush_relative(&mut self, force: bool, wheel: i16) {
+        let (dx, dy) = (self.rel.0.trunc(), self.rel.1.trunc());
+        let moved = dx != 0.0 || dy != 0.0;
+        if !force && (!moved || self.rel_sent.elapsed() < Duration::from_millis(10)) {
+            return;
+        }
+        self.rel.0 -= dx;
+        self.rel.1 -= dy;
+        self.rel_sent = Instant::now();
+        let clamp = |v: f64| v.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        let b = self.mouse_buttons;
+        if let Some(s) = self.session() {
+            s.send(proto::mouse_rel(clamp(dx), clamp(dy), b, wheel));
+        }
+    }
+
+    fn apply_grab(&mut self, window: &Window) {
+        use winit::window::CursorGrabMode;
+        let Some(grab) = self.want_grab.take() else { return };
+        if grab && !self.grabbed && self.can_input() {
+            let ok = window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            if let Err(e) = ok {
+                log::warn!("could not capture the pointer: {e}");
+            }
+            window.set_cursor_visible(false);
+            self.grabbed = true;
+            self.rel = (0.0, 0.0);
+            if let Some(s) = self.session() {
+                s.send(proto::mouse_origin());
+            }
+        } else if !grab && self.grabbed {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            self.grabbed = false;
         }
     }
 
@@ -688,6 +833,16 @@ impl WindowUi for ConsoleWindow {
     fn ui(&mut self, root: &mut egui::Ui, window: &Window, shell: &mut Shell) {
         let ctx = root.ctx().clone();
         self.poll();
+        if self.session().is_none() && self.grabbed {
+            self.want_grab = Some(false);
+        }
+        self.apply_grab(window);
+        if self.grabbed {
+            self.flush_relative(false, 0);
+            if self.rel.0.abs() >= 1.0 || self.rel.1.abs() >= 1.0 {
+                ctx.request_repaint_after(Duration::from_millis(10));
+            }
+        }
         self.update_texture(&ctx);
         self.update_stats();
         egui::Panel::top("menu").show(root, |ui| self.menu(ui, window, shell));
@@ -708,7 +863,10 @@ impl WindowUi for ConsoleWindow {
                     ui.separator();
                     ui.label(format!("{:.1} fps, {:.0} kbit/s", self.stats.fps, self.stats.kbps));
                 }
-                if self.can_input() && self.capture_keys {
+                if self.grabbed {
+                    ui.separator();
+                    ui.strong("Single cursor: press F9 to release the pointer");
+                } else if self.can_input() && self.capture_keys {
                     ui.separator();
                     ui.weak(if self.hovering_video { "Keyboard goes to the server" } else { "Point at the screen to type" });
                 }
@@ -716,6 +874,17 @@ impl WindowUi for ConsoleWindow {
         });
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::BLACK)).show(root, |ui| self.video(ui));
         self.dialogs(&ctx);
+        if self.show_about {
+            egui::Modal::new(egui::Id::unique("about")).show(&ctx, |ui| {
+                ui.heading(format!("idrac6 {}", env!("CARGO_PKG_VERSION")));
+                ui.label("Virtual console, virtual media and web UI proxy for Dell iDRAC6.");
+                ui.hyperlink("https://github.com/skylord123/idrac6-rs");
+                ui.weak("MIT licensed. Not affiliated with Dell or Vertiv/Avocent.");
+                if ui.button("Close").clicked() {
+                    self.show_about = false;
+                }
+            });
+        }
         let kvm = match &self.phase {
             Phase::Connected(s) if !s.is_closed() => Some(s),
             _ => None,
@@ -729,14 +898,21 @@ impl WindowUi for ConsoleWindow {
     fn raw_key(&mut self, ev: &KeyEvent) -> bool {
         // Keys go to the server while the pointer is over the video and no
         // dialog is open, like a KVM switch.
-        let modal_open = self.confirm_power.is_some() || self.sharing.is_some() || self.message.is_some();
+        let modal_open = self.confirm_power.is_some() || self.sharing.is_some() || self.message.is_some() || self.show_about;
         // Over the Virtual Media window the keyboard belongs to egui.
         if !self.capture_keys || !self.can_input() || modal_open {
             return false;
         }
         let PhysicalKey::Code(code) = ev.physical_key else { return false };
         let pressed = ev.state == ElementState::Pressed;
-        if !self.hovering_video && !self.pressed.contains(&keymap::hid_usage(code).unwrap_or(0)) {
+        if self.grabbed && code == KeyCode::F9 {
+            if pressed {
+                self.want_grab = Some(false);
+                self.repaint();
+            }
+            return true;
+        }
+        if !self.grabbed && !self.hovering_video && !self.pressed.contains(&keymap::hid_usage(code).unwrap_or(0)) {
             return false;
         }
         let Some(u) = keymap::hid_usage(code) else { return code != KeyCode::Fn };
@@ -751,8 +927,21 @@ impl WindowUi for ConsoleWindow {
         true
     }
 
+    fn raw_mouse_motion(&mut self, dx: f64, dy: f64) -> bool {
+        if !self.grabbed {
+            return false;
+        }
+        self.rel.0 += dx;
+        self.rel.1 += dy;
+        self.flush_relative(false, 0);
+        true
+    }
+
     fn focus_changed(&mut self, focused: bool) {
         self.focused = focused;
+        if !focused && self.grabbed {
+            self.want_grab = Some(false);
+        }
         if let Some(s) = self.session() {
             s.set_focus(focused);
         }
