@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 
 use super::Framebuffer;
 use super::dvc::DvcDecoder;
@@ -36,6 +36,8 @@ const MAX_H: usize = 1200;
 pub struct Ffmpeg {
     pub path: PathBuf,
     encoder: Encoder,
+    /// FFmpeg 5.1 and later; older versions only have `-vsync`.
+    fps_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +135,9 @@ pub fn find() -> Result<Ffmpeg, Missing> {
         let list = String::from_utf8_lossy(&out.stdout);
         let has = |name: &str| list.lines().any(|l| l.split_whitespace().nth(1) == Some(name));
         if let Some(&(encoder, _)) = Encoder::ALL.iter().find(|(_, n)| has(n)) {
-            return Ok(Ffmpeg { path, encoder });
+            let help = command(&path).args(["-hide_banner", "-h", "long"]).stdin(Stdio::null()).stderr(Stdio::null()).output();
+            let fps_mode = help.is_ok_and(|h| String::from_utf8_lossy(&h.stdout).contains("-fps_mode"));
+            return Ok(Ffmpeg { path, encoder, fps_mode });
         }
         found = Some(path);
     }
@@ -281,7 +285,7 @@ pub fn encode(ff: &Ffmpeg, rec: &Recording, out: &Path, progress: &mut dyn FnMut
         // Drop repeated pictures (the screen is mostly still) instead of
         // encoding them, keeping one a second; the video gets a variable
         // frame rate.
-        .args(["-vf", &format!("mpdecimate=hi=1:lo=1:frac=0:max={FPS}"), "-fps_mode", "vfr"])
+        .args(["-vf", &format!("mpdecimate=hi=1:lo=1:frac=0:max={FPS}"), if ff.fps_mode { "-fps_mode" } else { "-vsync" }, "vfr"])
         .args(ff.encoder.args())
         .args(["-pix_fmt", "yuv420p", "-color_range", "tv", "-colorspace", "smpte170m", "-color_primaries", "smpte170m", "-color_trc", "smpte170m"])
         .args(["-movflags", "+faststart", "-f", "mp4"])
@@ -291,7 +295,7 @@ pub fn encode(ff: &Ffmpeg, rec: &Recording, out: &Path, progress: &mut dyn FnMut
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("starting {}", ff.path.display()))?;
-    let errors = collect_stderr(&mut child);
+    let (errors, errors_thread) = collect_stderr(&mut child);
     let mut stdin = child.stdin.take().expect("piped stdin");
 
     let r = (|| -> Result<()> {
@@ -328,10 +332,22 @@ pub fn encode(ff: &Ffmpeg, rec: &Recording, out: &Path, progress: &mut dyn FnMut
         let _ = child.kill();
     }
     let status = child.wait().context("waiting for FFmpeg")?;
+    if let Some(t) = errors_thread {
+        let _ = t.join();
+    }
+    let failed = || {
+        let msg = errors.lock().unwrap().trim().to_string();
+        anyhow!("FFmpeg failed ({status}){}", if msg.is_empty() { String::new() } else { format!(": {msg}") })
+    };
+    // FFmpeg quitting early shows up as a broken pipe; its own message
+    // says why.
+    let r = match r {
+        Err(e) if !e.is::<Cancelled>() && !status.success() => Err(failed()),
+        r => r,
+    };
     let finish = r.and_then(|()| {
         if !status.success() {
-            let msg = errors.lock().unwrap().trim().to_string();
-            bail!("FFmpeg failed ({status}){}", if msg.is_empty() { String::new() } else { format!(": {msg}") });
+            return Err(failed());
         }
         std::fs::rename(&part, out).with_context(|| format!("saving {}", out.display()))?;
         Ok(())
@@ -353,11 +369,13 @@ fn part_path(out: &Path) -> PathBuf {
 }
 
 /// Keep the last bit of FFmpeg's error output.
-fn collect_stderr(child: &mut Child) -> Arc<Mutex<String>> {
+/// Collect the end of `child`'s stderr; join the thread to have all of it.
+fn collect_stderr(child: &mut Child) -> (Arc<Mutex<String>>, Option<std::thread::JoinHandle<()>>) {
     let buf = Arc::new(Mutex::new(String::new()));
+    let mut thread = None;
     if let Some(mut err) = child.stderr.take() {
         let b = buf.clone();
-        std::thread::spawn(move || {
+        thread = Some(std::thread::spawn(move || {
             let mut chunk = [0u8; 4096];
             while let Ok(n) = err.read(&mut chunk) {
                 if n == 0 {
@@ -371,9 +389,9 @@ fn collect_stderr(child: &mut Child) -> Arc<Mutex<String>> {
                     s.drain(..cut);
                 }
             }
-        });
+        }));
     }
-    buf
+    (buf, thread)
 }
 
 /// The video picture: the screen scaled to fit, centred on black.
@@ -510,6 +528,25 @@ mod tests {
         assert_eq!(px(0, 2), 0x00ff_0000);
         assert_eq!(px(7, 5), 0x00ff_0000);
         assert_eq!(px(7, 6), 0);
+    }
+
+    /// Both ways of asking for a variable frame rate make a video (with
+    /// the FFmpeg installed here, if there is one).
+    #[test]
+    fn encodes_with_fps_mode_and_vsync() {
+        if command(Path::new("ffmpeg")).arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
+            return;
+        }
+        let r = rec(&[(0, 64, 48), (500, 64, 48)]);
+        let dir = std::env::temp_dir().join(format!("idrac6-mp4-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for fps_mode in [true, false] {
+            let ff = Ffmpeg { path: "ffmpeg".into(), encoder: Encoder::Mpeg4, fps_mode };
+            let out = dir.join(format!("t-{fps_mode}.mp4"));
+            let done = encode(&ff, &r, &out, &mut |_| true).unwrap();
+            assert!(done.bytes > 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

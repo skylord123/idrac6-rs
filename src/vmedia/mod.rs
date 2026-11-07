@@ -119,6 +119,10 @@ impl Write for Conn {
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
 const MAP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Largest VDISK_READ_DATA payload sent in one packet.
+const MAX_READ_CHUNK: u32 = 1 << 20;
+/// Largest read request served; bigger ones get a read error.
+const MAX_READ_TOTAL: u64 = 16 << 20;
 
 impl VmSession {
     /// Connect and log in. Blocks until login succeeds or fails.
@@ -169,6 +173,12 @@ impl VmSession {
     /// media and may briefly affect virtual keyboard/mouse).
     pub fn usb_reset(&self) -> Result<()> {
         self.cmds.send(Cmd::UsbReset).map_err(|_| anyhow!("virtual media session is closed"))
+    }
+
+    /// Ask the session to unmap everything and close, without waiting.
+    /// Works while other threads still hold the session.
+    pub fn request_disconnect(&self) {
+        let _ = self.cmds.send(Cmd::Disconnect);
     }
 
     /// Unmap everything and close the connection.
@@ -512,16 +522,30 @@ impl<S: Read + Write> Worker<S> {
             self.send(&proto::client_status(disk, proto::CLIENT_STATUS_READ_ERROR))?;
             return Ok(());
         };
-        let factor = if factor == 0 { blocks.max(1) } else { factor };
-        let mut chunks = Vec::new();
+        let bs = m.image.block_size().max(1);
+        let kind = m.kind;
+        // Real reads are tens of KB. Refuse anything absurd instead of
+        // trying to serve it, including a range past block 2^32.
+        let too_big = blocks as u64 * bs as u64 > MAX_READ_TOTAL;
+        if too_big || start.checked_add(blocks).is_none() {
+            log::warn!("vmedia: refusing read of {blocks} blocks at {start}");
+            self.send(&proto::client_status(disk, proto::CLIENT_STATUS_READ_ERROR))?;
+            self.event(VmEvent::Error(format!("{kind:?}: refused a read of {blocks} blocks at block {start}")));
+            return Ok(());
+        }
+        // Answer in chunks of at most `factor` blocks (and at most
+        // MAX_READ_CHUNK bytes), sending each one as soon as it is read.
+        let factor = if factor == 0 { blocks } else { factor }.clamp(1, (MAX_READ_CHUNK / bs).max(1));
         let mut ok = true;
         let (mut s, mut left) = (start, blocks);
         while left > 0 {
             let n = left.min(factor);
+            let Some(m) = self.mapped.get_mut(&disk) else { break };
             match m.image.read_blocks(s, n) {
                 Ok(data) => {
                     m.read_bytes += data.len() as u64;
-                    chunks.push(proto::read_data(disk, s, n, &data));
+                    m.stats_dirty = true;
+                    self.send(&proto::read_data(disk, s, n, &data))?;
                 }
                 Err(e) => {
                     log::warn!("vmedia: read of {n} blocks at {s} failed: {e}");
@@ -531,11 +555,6 @@ impl<S: Read + Write> Worker<S> {
             }
             s += n;
             left -= n;
-        }
-        m.stats_dirty = true;
-        let kind = m.kind;
-        for c in chunks {
-            self.send(&c)?;
         }
         if ok {
             self.send(&proto::client_status(disk, proto::CLIENT_STATUS_OK))?;

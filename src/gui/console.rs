@@ -304,6 +304,8 @@ impl ConsoleWindow {
         let Some(info) = &self.info else { return };
         let params = info.kvm_params(&self.inst.host, shared);
         let session = KvmSession::start_with_recorder(params, self.notifier(), self.recorder.clone());
+        // The new session's counters start from zero.
+        self.stats = Stats::default();
         self.phase = Phase::Connected(session);
     }
 
@@ -566,8 +568,8 @@ impl ConsoleWindow {
         match self.stats.last {
             Some((t, f0, b0)) if now - t >= Duration::from_secs(1) => {
                 let dt = (now - t).as_secs_f32();
-                self.stats.fps = (frames - f0) as f32 / dt;
-                self.stats.kbps = (bytes - b0) as f32 * 8.0 / 1000.0 / dt;
+                self.stats.fps = frames.saturating_sub(f0) as f32 / dt;
+                self.stats.kbps = bytes.saturating_sub(b0) as f32 * 8.0 / 1000.0 / dt;
                 self.stats.last = Some((now, frames, bytes));
             }
             None => self.stats.last = Some((now, frames, bytes)),
@@ -1136,7 +1138,11 @@ impl ConsoleWindow {
         let image = egui::Image::new(sized).sense(egui::Sense::click_and_drag());
         let full = ui.max_rect();
         let resp = if self.fit {
-            ui.centered_and_justified(|ui| ui.add(image)).inner
+            let mut resp = ui.centered_and_justified(|ui| ui.add(image)).inner;
+            // The justified layout makes the response fill the panel; the
+            // picture is drawn centred in it. Map the pointer to the picture.
+            resp.rect = egui::Rect::from_center_size(resp.rect.center(), size);
+            resp
         } else {
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| ui.add(image)).inner
         };
@@ -1621,6 +1627,14 @@ impl WindowUi for ConsoleWindow {
             || self.closing;
         // Over the Virtual Media window the keyboard belongs to egui.
         if !self.capture_keys || !self.can_input() || modal_open {
+            // Still release a key the server saw go down, or it stays held.
+            if let (ElementState::Released, PhysicalKey::Code(code)) = (ev.state, ev.physical_key) {
+                if let Some(u) = keymap::hid_usage(code).filter(|u| self.pressed.remove(u)) {
+                    if let Some(s) = self.session() {
+                        s.key(u, false);
+                    }
+                }
+            }
             return false;
         }
         let PhysicalKey::Code(code) = ev.physical_key else { return false };

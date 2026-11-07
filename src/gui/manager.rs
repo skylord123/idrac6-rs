@@ -174,8 +174,13 @@ impl ManagerWindow {
     }
 
     fn remove(&mut self, i: usize) {
-        self.proxies.clear();
-        self.thumbs.clear();
+        // Keyed by index: drop this entry's and shift the ones after it, so
+        // the other servers' web proxies keep running.
+        fn shift<T>(m: &mut HashMap<usize, T>, i: usize) {
+            *m = std::mem::take(m).into_iter().filter(|(k, _)| *k != i).map(|(k, v)| (if k > i { k - 1 } else { k }, v)).collect();
+        }
+        shift(&mut self.proxies, i);
+        shift(&mut self.thumbs, i);
         if i < self.monitors.len() {
             self.monitors.remove(i);
         }

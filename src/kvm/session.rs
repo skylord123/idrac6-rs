@@ -272,6 +272,12 @@ impl Write for Conn {
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the iDRAC gets to answer the login request. Longer than its
+/// own wait for another user to answer a sharing request.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest compressed video frame collected before it is given up on.
+const MAX_PENDING_FRAME: usize = 16 << 20;
 /// How long a socket read blocks before we check the outgoing queue.
 const POLL: Duration = Duration::from_millis(8);
 
@@ -292,6 +298,7 @@ fn open(host: &str, port: u16, apcp: Option<ApcpChannel>) -> Result<Conn> {
             if reply.redirect_port != 0 {
                 tcp = TcpStream::connect_timeout(&std::net::SocketAddr::new(addr.ip(), reply.redirect_port), CONNECT_TIMEOUT)?;
                 tcp.set_nodelay(true).ok();
+                tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
             }
             reply.use_ssl
         }
@@ -304,12 +311,14 @@ fn open(host: &str, port: u16, apcp: Option<ApcpChannel>) -> Result<Conn> {
         Conn::Plain(tcp)
     };
     conn.tcp().set_read_timeout(Some(POLL))?;
+    // An iDRAC that stops reading must not block a write forever.
+    conn.tcp().set_write_timeout(Some(WRITE_TIMEOUT))?;
     Ok(conn)
 }
 
 fn write_all(c: &mut Conn, data: &[u8]) -> Result<()> {
-    // Writes go through even though reads use a short timeout: the socket
-    // has no write timeout, so this simply blocks until sent.
+    // Writes go through even though reads use a short timeout: they block
+    // until sent, up to WRITE_TIMEOUT.
     c.write_all(data)?;
     c.flush()?;
     Ok(())
@@ -329,11 +338,15 @@ fn command_thread(ctx: &Ctx, outgoing: Receiver<Vec<u8>>) -> Result<()> {
     let mut reader = FrameReader::new(true);
     let mut last_keepalive = Instant::now();
     let mut logged_in = false;
+    let login_sent = Instant::now();
     let mut video: Option<VideoAssembler> = None;
 
     loop {
         if ctx.stopped() {
             return Ok(());
+        }
+        if !logged_in && login_sent.elapsed() >= LOGIN_TIMEOUT {
+            bail!("The iDRAC did not answer the console login.");
         }
         // Flush queued input.
         loop {
@@ -411,10 +424,11 @@ fn command_thread(ctx: &Ctx, outgoing: Receiver<Vec<u8>>) -> Result<()> {
                     ctx.send(KvmEvent::DisconnectReason(reason));
                     bail!("{}", disconnect_reason(reason));
                 }
-                t if t & 0xff00 == 0x8600 || t & 0xff00 == 0x8500 => {
-                    // Video multiplexed onto the command channel.
+                t if t & 0xff00 == 0x8600 => {
+                    // Video multiplexed onto the command channel: 0x86nn is
+                    // video type 0x80 | nn (0x8601 is 0x81).
                     if let Some(v) = video.as_mut() {
-                        let msg = Message { ty: t & 0xff, payload: m.payload };
+                        let msg = Message { ty: 0x80 | (t & 0xff), payload: m.payload };
                         if let Some(reply) = v.handle(ctx, msg)? {
                             write_all(&mut conn, &reply)?;
                         }
@@ -590,7 +604,13 @@ impl VideoAssembler {
                     return Ok(Some(proto::video_ack(1)));
                 } else if let Some((h, buf)) = self.pending.as_mut() {
                     buf.extend_from_slice(data);
-                    if aspeed::frame_complete(h, buf) {
+                    if buf.len() > MAX_PENDING_FRAME {
+                        // A frame that never completes (e.g. a bad header):
+                        // drop it and ask for a fresh picture.
+                        log::warn!("dropping an unfinished {} byte video frame", buf.len());
+                        self.pending = None;
+                        let _ = ctx.cmd_tx.send(proto::screen_refresh());
+                    } else if aspeed::frame_complete(h, buf) {
                         let (h, buf) = self.pending.take().unwrap();
                         self.decode(ctx, &h, &buf);
                     }

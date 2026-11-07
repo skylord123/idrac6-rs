@@ -158,8 +158,9 @@ pub fn run(inst: &Instance, mode: Mode, wait_on_error: bool) -> Result<i32> {
     Ok(code)
 }
 
-/// What the password helper uses to find the iDRAC again.
-fn lookup_key(inst: &Instance) -> String {
+/// What the password helper (and a terminal opened from the manager)
+/// uses to find the iDRAC again.
+pub fn lookup_key(inst: &Instance) -> String {
     format!("{}@{}:{}", inst.username, inst.host, inst.https_port)
 }
 
@@ -224,10 +225,7 @@ pub fn open_terminal(inst: &Instance, mode: Mode, _custom: &str) -> Result<()> {
         }
     }
     let ssh = command(inst, mode)?;
-    let quote = |a: &std::ffi::OsStr| {
-        let a = a.to_string_lossy();
-        if a.is_empty() || a.contains([' ', '&', '|', '^', '(', ')', '<', '>']) { format!("\"{a}\"") } else { a.into_owned() }
-    };
+    let quote = |a: &std::ffi::OsStr| win_quote(&a.to_string_lossy());
     let line = std::iter::once(quote(ssh.get_program())).chain(ssh.get_args().map(quote)).collect::<Vec<_>>().join(" ");
     let title: String = title(inst, mode).chars().filter(|c| c.is_alphanumeric() || " .:-_".contains(*c)).collect();
     let note = match mode {
@@ -249,10 +247,41 @@ pub fn open_terminal(inst: &Instance, mode: Mode, _custom: &str) -> Result<()> {
     Ok(())
 }
 
+/// Quote one argument for a Windows command line, the way the C runtime
+/// splits it again: quotes inside are escaped, and so are backslashes in
+/// front of them.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win_quote(a: &str) -> String {
+    if !a.is_empty() && !a.contains([' ', '\t', '"', '&', '|', '^', '(', ')', '<', '>']) {
+        return a.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for c in a.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', slashes * 2));
+    out.push('"');
+    out
+}
+
 /// The argument `idrac6 ssh` finds `inst` by.
 #[cfg_attr(windows, allow(dead_code))]
 fn selector(inst: &Instance) -> String {
-    if inst.name.is_empty() { inst.host.clone() } else { inst.name.clone() }
+    // Names need not be unique; this picks out exactly this entry.
+    lookup_key(inst)
 }
 
 mod terminal {
@@ -401,6 +430,19 @@ mod tests {
         assert!(!is_password_prompt_for("me@bastion.example's password: ", &inst));
         assert!(!is_password_prompt_for("Are you sure you want to continue connecting (yes/no)?", &inst));
         assert!(!is_password_prompt_for("Enter passphrase for key: root@10.0.0.5", &inst));
+    }
+
+    #[test]
+    fn quotes_windows_arguments() {
+        assert_eq!(win_quote("-p"), "-p");
+        assert_eq!(win_quote(""), "\"\"");
+        assert_eq!(win_quote(r"C:\Program Files\ssh.exe"), r#""C:\Program Files\ssh.exe""#);
+        assert_eq!(
+            win_quote(r#"UserKnownHostsFile="C:\Users\A B\known""#),
+            r#""UserKnownHostsFile=\"C:\Users\A B\known\"""#
+        );
+        assert_eq!(win_quote(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(win_quote(r"dir with space\"), r#""dir with space\\""#);
     }
 
     #[test]

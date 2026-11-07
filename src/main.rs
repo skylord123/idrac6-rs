@@ -156,10 +156,14 @@ fn export(file: &std::path::Path, out: Option<std::path::PathBuf>) -> anyhow::Re
 
 /// Look up a saved iDRAC by name or address.
 fn find_saved(want: &str) -> anyhow::Result<config::Instance> {
-    config::Config::load()
-        .instances
-        .into_iter()
-        .find(|i| i.name.eq_ignore_ascii_case(want) || i.host == want)
+    let mut instances = config::Config::load().instances;
+    // An exact user@host:port first (what the manager passes), then a
+    // name or address.
+    let n = instances
+        .iter()
+        .position(|i| ssh::lookup_key(i) == want)
+        .or_else(|| instances.iter().position(|i| i.name.eq_ignore_ascii_case(want) || i.host == want));
+    n.map(|n| instances.swap_remove(n))
         .ok_or_else(|| anyhow::anyhow!("no saved iDRAC called '{want}'"))
 }
 

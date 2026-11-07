@@ -67,26 +67,37 @@ fn parse_response(raw: &[u8]) -> Result<Response> {
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect();
     let mut body = raw[split + 4..].to_vec();
-    let chunked = headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked"));
-    if chunked {
-        body = dechunk(&body);
+    let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    if header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
+        body = dechunk(&body)?;
+    } else if let Some(len) = header("content-length").and_then(|v| v.parse::<usize>().ok()).filter(|_| !matches!(status, 204 | 304)) {
+        // The connection can end early (timeout, reset); don't return
+        // half a file as if it were all of it.
+        if body.len() < len {
+            bail!("the response was cut off ({} of {len} bytes)", body.len());
+        }
+        body.truncate(len);
     }
     Ok(Response { status, headers, body })
 }
 
-fn dechunk(mut b: &[u8]) -> Vec<u8> {
+fn dechunk(mut b: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     while let Some(eol) = b.windows(2).position(|w| w == b"\r\n") {
         let size_str = String::from_utf8_lossy(&b[..eol]);
-        let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("0").trim(), 16).unwrap_or(0);
+        let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16)
+            .with_context(|| format!("bad chunk size {size_str:?} in the response"))?;
         b = &b[eol + 2..];
-        if size == 0 || size > b.len() {
+        if size == 0 {
             break;
+        }
+        if size > b.len() {
+            bail!("the response was cut off in the middle of a chunk");
         }
         out.extend_from_slice(&b[..size]);
         b = &b[(size + 2).min(b.len())..];
     }
-    out
+    Ok(out)
 }
 
 /// Percent-encode a form value the way the iDRAC login page does.
@@ -545,6 +556,14 @@ mod tests {
     fn parses_chunked() {
         let r = parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n").unwrap();
         assert_eq!(r.body, b"abcde");
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabc").is_err());
+    }
+
+    #[test]
+    fn detects_cut_off_body() {
+        let r = parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").unwrap();
+        assert_eq!(r.body, b"abc");
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc").is_err());
     }
 
     #[test]
