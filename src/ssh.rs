@@ -158,8 +158,9 @@ pub fn run(inst: &Instance, mode: Mode, wait_on_error: bool) -> Result<i32> {
     Ok(code)
 }
 
-/// What the password helper uses to find the iDRAC again.
-fn lookup_key(inst: &Instance) -> String {
+/// What the password helper (and a terminal opened from the manager)
+/// uses to find the iDRAC again.
+pub fn lookup_key(inst: &Instance) -> String {
     format!("{}@{}:{}", inst.username, inst.host, inst.https_port)
 }
 
@@ -279,7 +280,8 @@ fn win_quote(a: &str) -> String {
 /// The argument `idrac6 ssh` finds `inst` by.
 #[cfg_attr(windows, allow(dead_code))]
 fn selector(inst: &Instance) -> String {
-    if inst.name.is_empty() { inst.host.clone() } else { inst.name.clone() }
+    // Names need not be unique; this picks out exactly this entry.
+    lookup_key(inst)
 }
 
 mod terminal {
