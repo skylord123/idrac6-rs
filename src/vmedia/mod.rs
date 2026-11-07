@@ -175,6 +175,12 @@ impl VmSession {
         self.cmds.send(Cmd::UsbReset).map_err(|_| anyhow!("virtual media session is closed"))
     }
 
+    /// Ask the session to unmap everything and close, without waiting.
+    /// Works while other threads still hold the session.
+    pub fn request_disconnect(&self) {
+        let _ = self.cmds.send(Cmd::Disconnect);
+    }
+
     /// Unmap everything and close the connection.
     pub fn disconnect(mut self) {
         self.shutdown();

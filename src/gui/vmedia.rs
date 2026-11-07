@@ -82,13 +82,19 @@ impl VmPanel {
     }
 
     pub fn disconnect(&mut self) {
+        // A login still in progress: dropping its receiver drops the
+        // session it returns, which disconnects it.
+        self.session_rx = None;
         if let State::Connected(s) = std::mem::replace(&mut self.state, State::Idle) {
-            // A map/unmap thread may still hold a reference; dropping the
-            // last one disconnects as well.
-            if let Ok(s) = Arc::try_unwrap(s) {
-                s.disconnect();
+            // A map/unmap thread may still hold a reference, so ask the
+            // worker to close; dropping the last reference joins it.
+            match Arc::try_unwrap(s) {
+                Ok(s) => s.disconnect(),
+                Err(s) => s.request_disconnect(),
             }
         }
+        // Late events from the old session must not reach a new one.
+        (self.tx, self.rx) = mpsc::channel();
         self.mapped.clear();
     }
 
