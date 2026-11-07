@@ -226,7 +226,15 @@ impl App {
             let _ = w.context.make_current(&w.surface);
             w.egui.destroy();
             if w.ui.is_main() {
-                el.exit();
+                // Close the other windows the normal way, so recordings are
+                // finished. One still saving a video stays open until it is
+                // done; the app quits when the last window closes.
+                let others: Vec<WindowId> = self.windows.keys().copied().collect();
+                for other in others {
+                    if self.windows.get_mut(&other).is_some_and(|o| o.ui.close_requested()) {
+                        self.close(el, other);
+                    }
+                }
             }
         }
         if self.windows.is_empty() {
