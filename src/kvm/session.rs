@@ -422,10 +422,11 @@ fn command_thread(ctx: &Ctx, outgoing: Receiver<Vec<u8>>) -> Result<()> {
                     ctx.send(KvmEvent::DisconnectReason(reason));
                     bail!("{}", disconnect_reason(reason));
                 }
-                t if t & 0xff00 == 0x8600 || t & 0xff00 == 0x8500 => {
-                    // Video multiplexed onto the command channel.
+                t if t & 0xff00 == 0x8600 => {
+                    // Video multiplexed onto the command channel: 0x86nn is
+                    // video type 0x80 | nn (0x8601 is 0x81).
                     if let Some(v) = video.as_mut() {
-                        let msg = Message { ty: t & 0xff, payload: m.payload };
+                        let msg = Message { ty: 0x80 | (t & 0xff), payload: m.payload };
                         if let Some(reply) = v.handle(ctx, msg)? {
                             write_all(&mut conn, &reply)?;
                         }
