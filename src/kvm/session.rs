@@ -276,6 +276,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the iDRAC gets to answer the login request. Longer than its
 /// own wait for another user to answer a sharing request.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest compressed video frame collected before it is given up on.
+const MAX_PENDING_FRAME: usize = 16 << 20;
 /// How long a socket read blocks before we check the outgoing queue.
 const POLL: Duration = Duration::from_millis(8);
 
@@ -602,7 +604,13 @@ impl VideoAssembler {
                     return Ok(Some(proto::video_ack(1)));
                 } else if let Some((h, buf)) = self.pending.as_mut() {
                     buf.extend_from_slice(data);
-                    if aspeed::frame_complete(h, buf) {
+                    if buf.len() > MAX_PENDING_FRAME {
+                        // A frame that never completes (e.g. a bad header):
+                        // drop it and ask for a fresh picture.
+                        log::warn!("dropping an unfinished {} byte video frame", buf.len());
+                        self.pending = None;
+                        let _ = ctx.cmd_tx.send(proto::screen_refresh());
+                    } else if aspeed::frame_complete(h, buf) {
                         let (h, buf) = self.pending.take().unwrap();
                         self.decode(ctx, &h, &buf);
                     }
