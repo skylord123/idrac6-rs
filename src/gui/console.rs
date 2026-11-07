@@ -1136,7 +1136,11 @@ impl ConsoleWindow {
         let image = egui::Image::new(sized).sense(egui::Sense::click_and_drag());
         let full = ui.max_rect();
         let resp = if self.fit {
-            ui.centered_and_justified(|ui| ui.add(image)).inner
+            let mut resp = ui.centered_and_justified(|ui| ui.add(image)).inner;
+            // The justified layout makes the response fill the panel; the
+            // picture is drawn centred in it. Map the pointer to the picture.
+            resp.rect = egui::Rect::from_center_size(resp.rect.center(), size);
+            resp
         } else {
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| ui.add(image)).inner
         };
