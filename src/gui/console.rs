@@ -1625,6 +1625,14 @@ impl WindowUi for ConsoleWindow {
             || self.closing;
         // Over the Virtual Media window the keyboard belongs to egui.
         if !self.capture_keys || !self.can_input() || modal_open {
+            // Still release a key the server saw go down, or it stays held.
+            if let (ElementState::Released, PhysicalKey::Code(code)) = (ev.state, ev.physical_key) {
+                if let Some(u) = keymap::hid_usage(code).filter(|u| self.pressed.remove(u)) {
+                    if let Some(s) = self.session() {
+                        s.key(u, false);
+                    }
+                }
+            }
             return false;
         }
         let PhysicalKey::Code(code) = ev.physical_key else { return false };
