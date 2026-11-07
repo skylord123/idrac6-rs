@@ -304,6 +304,8 @@ impl ConsoleWindow {
         let Some(info) = &self.info else { return };
         let params = info.kvm_params(&self.inst.host, shared);
         let session = KvmSession::start_with_recorder(params, self.notifier(), self.recorder.clone());
+        // The new session's counters start from zero.
+        self.stats = Stats::default();
         self.phase = Phase::Connected(session);
     }
 
@@ -566,8 +568,8 @@ impl ConsoleWindow {
         match self.stats.last {
             Some((t, f0, b0)) if now - t >= Duration::from_secs(1) => {
                 let dt = (now - t).as_secs_f32();
-                self.stats.fps = (frames - f0) as f32 / dt;
-                self.stats.kbps = (bytes - b0) as f32 * 8.0 / 1000.0 / dt;
+                self.stats.fps = frames.saturating_sub(f0) as f32 / dt;
+                self.stats.kbps = bytes.saturating_sub(b0) as f32 * 8.0 / 1000.0 / dt;
                 self.stats.last = Some((now, frames, bytes));
             }
             None => self.stats.last = Some((now, frames, bytes)),
