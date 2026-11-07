@@ -59,5 +59,9 @@ pub fn connect(host: &str, port: u16) -> Result<SslStream<TcpStream>> {
     let tcp = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10))
         .with_context(|| format!("connecting to {host}:{port}"))?;
     tcp.set_nodelay(true).ok();
+    // A server that accepts but never finishes the handshake must not
+    // hang the caller. Callers set their own timeouts afterwards.
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
     wrap(tcp, host)
 }
