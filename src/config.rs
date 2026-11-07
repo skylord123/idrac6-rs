@@ -96,7 +96,13 @@ impl Config {
         let path = config_file();
         let mut c: Config = match std::fs::read_to_string(&path) {
             Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                log::error!("ignoring unreadable config {}: {e}", path.display());
+                // Set the file aside, or the next save would replace it with
+                // an empty config and lose every saved iDRAC.
+                let bad = path.with_extension("toml.bad");
+                match std::fs::rename(&path, &bad) {
+                    Ok(()) => log::error!("could not read the config {}, moved it to {}: {e}", path.display(), bad.display()),
+                    Err(re) => log::error!("could not read the config {}: {e} (and could not move it aside: {re})", path.display()),
+                }
                 Config::default()
             }),
             Err(_) => Config::default(),
