@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 
 use super::Framebuffer;
 use super::dvc::DvcDecoder;
@@ -291,7 +291,7 @@ pub fn encode(ff: &Ffmpeg, rec: &Recording, out: &Path, progress: &mut dyn FnMut
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("starting {}", ff.path.display()))?;
-    let errors = collect_stderr(&mut child);
+    let (errors, errors_thread) = collect_stderr(&mut child);
     let mut stdin = child.stdin.take().expect("piped stdin");
 
     let r = (|| -> Result<()> {
@@ -328,10 +328,22 @@ pub fn encode(ff: &Ffmpeg, rec: &Recording, out: &Path, progress: &mut dyn FnMut
         let _ = child.kill();
     }
     let status = child.wait().context("waiting for FFmpeg")?;
+    if let Some(t) = errors_thread {
+        let _ = t.join();
+    }
+    let failed = || {
+        let msg = errors.lock().unwrap().trim().to_string();
+        anyhow!("FFmpeg failed ({status}){}", if msg.is_empty() { String::new() } else { format!(": {msg}") })
+    };
+    // FFmpeg quitting early shows up as a broken pipe; its own message
+    // says why.
+    let r = match r {
+        Err(e) if !e.is::<Cancelled>() && !status.success() => Err(failed()),
+        r => r,
+    };
     let finish = r.and_then(|()| {
         if !status.success() {
-            let msg = errors.lock().unwrap().trim().to_string();
-            bail!("FFmpeg failed ({status}){}", if msg.is_empty() { String::new() } else { format!(": {msg}") });
+            return Err(failed());
         }
         std::fs::rename(&part, out).with_context(|| format!("saving {}", out.display()))?;
         Ok(())
@@ -353,11 +365,13 @@ fn part_path(out: &Path) -> PathBuf {
 }
 
 /// Keep the last bit of FFmpeg's error output.
-fn collect_stderr(child: &mut Child) -> Arc<Mutex<String>> {
+/// Collect the end of `child`'s stderr; join the thread to have all of it.
+fn collect_stderr(child: &mut Child) -> (Arc<Mutex<String>>, Option<std::thread::JoinHandle<()>>) {
     let buf = Arc::new(Mutex::new(String::new()));
+    let mut thread = None;
     if let Some(mut err) = child.stderr.take() {
         let b = buf.clone();
-        std::thread::spawn(move || {
+        thread = Some(std::thread::spawn(move || {
             let mut chunk = [0u8; 4096];
             while let Ok(n) = err.read(&mut chunk) {
                 if n == 0 {
@@ -371,9 +385,9 @@ fn collect_stderr(child: &mut Child) -> Arc<Mutex<String>> {
                     s.drain(..cut);
                 }
             }
-        });
+        }));
     }
-    buf
+    (buf, thread)
 }
 
 /// The video picture: the screen scaled to fit, centred on black.
