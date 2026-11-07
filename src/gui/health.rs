@@ -68,8 +68,14 @@ impl<T: Send + 'static> Load<T> {
         self.pending.is_some()
     }
 
+    /// Never loaded. After a failure only Refresh tries again, so a wrong
+    /// password does not turn into a stream of failed logins.
+    fn missing(&self) -> bool {
+        self.data.is_none() && self.error.is_none()
+    }
+
     fn stale(&self) -> bool {
-        self.at.is_none_or(|t| t.elapsed() >= REFRESH_EVERY)
+        self.error.is_none() && self.at.is_none_or(|t| t.elapsed() >= REFRESH_EVERY)
     }
 }
 
@@ -142,13 +148,13 @@ impl HealthWindow {
         let c = self.client.clone();
         match self.tab {
             Tab::Overview => {
-                if force || self.summary.data.is_none() {
+                if force || self.summary.missing() {
                     self.summary.start(&c, &n, health::fetch_summary);
                 }
                 if force || self.sensors.stale() {
                     self.sensors.start(&c, &n, health::fetch_sensors);
                 }
-                if force || self.sel.data.is_none() {
+                if force || self.sel.missing() {
                     self.sel.start(&c, &n, health::fetch_sel);
                 }
             }
@@ -163,12 +169,12 @@ impl HealthWindow {
                 }
             }
             Tab::Log => {
-                if force || self.sel.data.is_none() {
+                if force || self.sel.missing() {
                     self.sel.start(&c, &n, health::fetch_sel);
                 }
             }
             Tab::Sessions => {
-                if force || self.sessions.data.is_none() {
+                if force || self.sessions.missing() {
                     self.sessions.start(&c, &n, health::fetch_sessions);
                 }
             }
