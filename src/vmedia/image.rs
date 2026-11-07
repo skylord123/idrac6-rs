@@ -163,7 +163,11 @@ impl Image {
         }
         let bs = self.block_size() as u64;
         let off = (start as u64 + self.geometry.lba_start) * bs;
-        if off + data.len() as u64 > self.size {
+        // With only one partition exposed, its end is the limit, not the
+        // end of the file.
+        let past_partition =
+            self.geometry.lba_start > 0 && start as u64 + (data.len() as u64).div_ceil(bs) > self.geometry.blocks as u64;
+        if off + data.len() as u64 > self.size || past_partition {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "write past end of image"));
         }
         self.backing.write_at(off, data)
@@ -267,6 +271,11 @@ mod tests {
         assert_eq!(img.geometry.blocks, 4000);
         assert_eq!(img.geometry.lba_start, 63);
         assert_eq!(img.read_blocks(0, 1).unwrap()[0], 0xAB);
+        let mut rw = Image::img(Box::new(io::Cursor::new(v.clone())), false, true).unwrap();
+        rw.write_blocks(3999, &[1u8; 512]).unwrap();
+        // Inside the file, but past the end of the exposed partition.
+        assert!(rw.write_blocks(4000, &[1u8; 512]).is_err());
+        assert!(rw.write_blocks(3999, &[1u8; 1024]).is_err());
         let mut whole = Image::img(Box::new(io::Cursor::new(v)), true, false).unwrap();
         assert_eq!(whole.geometry.blocks, 4096);
         assert_eq!(whole.read_blocks(0, 1).unwrap()[0], 0x33);
