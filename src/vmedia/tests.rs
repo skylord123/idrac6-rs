@@ -165,6 +165,27 @@ fn fake_idrac_session() {
         assert_eq!(got[2][20], 8);
         assert_eq!(got[1][20 + 2048], 7);
 
+        // Oversized (32 GiB, factor 0) and overflowing reads are refused
+        // with a read error and no data.
+        for (start, blocks) in [(0u32, 0x00FF_FFFFu32), (u32::MAX - 1, 4)] {
+            let mut body = vec![0, 1];
+            body.extend_from_slice(&start.to_be_bytes());
+            body.extend_from_slice(&blocks.to_be_bytes());
+            body.extend_from_slice(&0u32.to_be_bytes());
+            s.write_all(&avmp(proto::ty::VDISK_READ, &body)).unwrap();
+            loop {
+                let p = read_packet_blocking(&mut s).unwrap();
+                match proto::packet_type(&p) {
+                    proto::ty::CLIENT_STATUS => {
+                        assert_eq!(be32(&p, 12), proto::CLIENT_STATUS_READ_ERROR);
+                        break;
+                    }
+                    proto::ty::HEARTBEAT => {}
+                    t => panic!("unexpected {t}"),
+                }
+            }
+        }
+
         s.write_all(&avmp(proto::ty::DISCONNECT, &[0, 0, 1, 0, 0])).unwrap();
         // Client may release on its way out; drain until close.
         let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
